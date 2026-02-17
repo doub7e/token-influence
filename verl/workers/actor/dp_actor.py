@@ -449,11 +449,12 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
-                    if self.config.use_kl_loss:
+                    use_token_entropy_separate = self.config.get("use_token_entropy_separate", False)
+                    if self.config.get("use_kl_loss", False):
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                        if self.config.use_token_entropy_separate:
+                        if use_token_entropy_separate:
                             low_entropy_kl_loss = agg_loss(loss_mat=kld, loss_mask=high_entropy_mask, loss_agg_mode=loss_agg_mode)
                             high_entropy_kl_loss = agg_loss(loss_mat=kld, loss_mask=low_entropy_mask, loss_agg_mode=loss_agg_mode)
                             kl_loss = low_entropy_kl_loss + high_entropy_kl_loss
@@ -464,7 +465,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
-                        if self.config.use_token_entropy_separate:
+                        if use_token_entropy_separate:
                             metrics["actor/low_entropy_kl_loss"] = low_entropy_kl_loss.detach().item()
                             metrics["actor/high_entropy_kl_loss"] = high_entropy_kl_loss.detach().item()
                             metrics["actor/high_entropy_kl_loss_scale_coef"] = self.config.high_entropy_kl_loss_scale_coef

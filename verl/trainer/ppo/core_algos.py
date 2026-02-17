@@ -552,6 +552,9 @@ def compute_policy_loss_archer(
     assert negative_clip_ratio_c > 1.0, "The negative_clip_ratio_c should be greater than 1.0," + f" but get the value: {negative_clip_ratio_c}."
     assert positive_clip_ratio_c > 1.0, "The positive_clip_ratio_c should be greater than 1.0," + f" but get the value: {positive_clip_ratio_c}."
 
+    # Some pipelines provide 0/1 integer masks; torch.where expects boolean condition.
+    high_entropy_mask = high_entropy_mask.to(dtype=torch.bool)
+
     ratio = torch.exp(torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0))
 
     negative_clip_ratio = torch.where(high_entropy_mask, torch.clamp(ratio, min=1-negative_low_entropy_clip_ratio_low, max=None), torch.clamp(ratio, min=1-negative_high_entropy_clip_ratio_low, max=None))
