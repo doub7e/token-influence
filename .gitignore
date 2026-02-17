@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.eggs/
+dist/
+build/
+
+# Data & outputs
+data/
+output/
+outputs/
+
+# Weights & Biases
+wandb/
+
+# Logs
+*.log
