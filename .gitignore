@@ -16,3 +16,6 @@ wandb/
 
 # Logs
 *.log
+
+# Local model checkpoints (do not commit weights)
+models/

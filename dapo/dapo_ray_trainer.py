@@ -27,6 +27,8 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _timer, apply_kl_penalty, compute_advantage, compute_response_mask
 
+from .entropy_trace import RolloutEntropyTraceWriter
+
 
 class RayDAPOTrainer(RayPPOTrainer):
     """
@@ -49,6 +51,14 @@ class RayDAPOTrainer(RayPPOTrainer):
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
+        )
+        entropy_trace_cfg = self.config.trainer.get("entropy_trace", {})
+        entropy_trace_output_dir = entropy_trace_cfg.get("output_dir", f"{self.config.trainer.default_local_dir}/entropy_trace")
+        entropy_trace_writer = RolloutEntropyTraceWriter(
+            enabled=bool(entropy_trace_cfg.get("enable", False)),
+            output_dir=entropy_trace_output_dir,
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
         )
 
         self.global_steps = 0
@@ -268,6 +278,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
+                        try:
+                            entropy_trace_writer.write_step(
+                                step=self.global_steps,
+                                batch=batch,
+                                entropies=entropys,
+                                response_mask=response_masks,
+                            )
+                        except Exception as e:
+                            print(f"[WARN] failed to write entropy trace at step {self.global_steps}: {e}")
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
