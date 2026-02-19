@@ -7,6 +7,7 @@
 '''
 
 
+import hashlib
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -28,6 +29,84 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _timer, apply_kl_penalty, compute_advantage, compute_response_mask
 
 from .entropy_trace import RolloutEntropyTraceWriter
+from .influence_trace import RolloutInfluenceTraceWriter
+
+
+def _uid_hash64(uid: str) -> int:
+    digest = hashlib.sha1(uid.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="little", signed=False) & 0x7FFFFFFFFFFFFFFF
+
+
+def _prepare_influence_trace_batch(
+    batch: DataProto,
+    *,
+    world_size: int,
+    max_prompts_per_step: int,
+) -> tuple[int, int, dict[str, int]]:
+    if "token_level_rewards" not in batch.batch:
+        raise ValueError("token_level_rewards is required for influence trace.")
+    if "uid" not in batch.non_tensor_batch:
+        raise ValueError("uid is required for influence trace.")
+    seq_rewards = batch.batch["token_level_rewards"].sum(dim=-1).detach().to(torch.float32).cpu()
+    accepted = torch.zeros_like(seq_rewards, dtype=torch.bool)
+    uids = np.asarray(batch.non_tensor_batch["uid"]).astype(str)
+    uid_to_indices: dict[str, np.ndarray] = {}
+    for uid in np.unique(uids):
+        uid_to_indices[uid] = np.where(uids == uid)[0]
+        uid_rewards = seq_rewards[uid_to_indices[uid]]
+        accepted[uid_to_indices[uid]] = uid_rewards == uid_rewards.max()
+
+    batch_size = len(batch)
+    if batch_size % world_size != 0:
+        raise ValueError(f"Batch size {batch_size} must be divisible by world size {world_size}.")
+    chunk_size = batch_size // world_size
+
+    selected_uid: list[str] = []
+    uid_constant = 0
+    uid_mixed = 0
+    uid_cross_rank = 0
+    for uid, idx in uid_to_indices.items():
+        if idx.size == 0:
+            continue
+        uid_rewards = seq_rewards[idx]
+        if bool((uid_rewards.max() == uid_rewards.min()).item()):
+            uid_constant += 1
+            continue
+        local_acc = accepted[idx]
+        if (not bool(local_acc.any().item())) or (not bool((~local_acc).any().item())):
+            continue
+        uid_mixed += 1
+        rank_lo = int(idx.min() // chunk_size)
+        rank_hi = int(idx.max() // chunk_size)
+        if rank_lo != rank_hi:
+            uid_cross_rank += 1
+            continue
+        selected_uid.append(uid)
+        if len(selected_uid) >= max_prompts_per_step:
+            break
+
+    selected_mask = np.zeros((batch_size,), dtype=np.bool_)
+    group_id = np.full((batch_size,), -1, dtype=np.int32)
+    uid_hash = np.array([_uid_hash64(str(x)) for x in uids], dtype=np.int64)
+    for gid, uid in enumerate(selected_uid):
+        idx = uid_to_indices[uid]
+        selected_mask[idx] = True
+        group_id[idx] = gid
+
+    batch.batch["influence_trace_selected"] = torch.from_numpy(selected_mask)
+    batch.batch["influence_trace_group_id"] = torch.from_numpy(group_id)
+    batch.batch["influence_trace_row_id"] = torch.arange(batch_size, dtype=torch.int32)
+    batch.batch["influence_trace_reward"] = seq_rewards.to(torch.float32)
+    batch.batch["influence_trace_accepted"] = accepted.to(torch.bool)
+    batch.batch["influence_trace_uid_hash"] = torch.from_numpy(uid_hash)
+    debug_counts = {
+        "uid_total": int(len(uid_to_indices)),
+        "uid_constant": int(uid_constant),
+        "uid_mixed": int(uid_mixed),
+        "uid_cross_rank": int(uid_cross_rank),
+        "uid_selected": int(len(selected_uid)),
+    }
+    return int(selected_mask.sum()), len(selected_uid), debug_counts
 
 
 class RayDAPOTrainer(RayPPOTrainer):
@@ -59,6 +138,21 @@ class RayDAPOTrainer(RayPPOTrainer):
             output_dir=entropy_trace_output_dir,
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
+            write_every=int(entropy_trace_cfg.get("write_every", 1)),
+            update_summary_every=int(entropy_trace_cfg.get("update_summary_every", 1)),
+            atomic_write=bool(entropy_trace_cfg.get("atomic_write", True)),
+            fsync=bool(entropy_trace_cfg.get("fsync", False)),
+        )
+        influence_trace_cfg = self.config.trainer.get("influence_trace", {})
+        influence_trace_output_dir = influence_trace_cfg.get("output_dir", f"{self.config.trainer.default_local_dir}/influence_trace")
+        influence_trace_writer = RolloutInfluenceTraceWriter(
+            enabled=bool(influence_trace_cfg.get("enable", False)),
+            output_dir=influence_trace_output_dir,
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            write_every=int(influence_trace_cfg.get("write_every", 1)),
+            atomic_write=bool(influence_trace_cfg.get("atomic_write", True)),
+            fsync=bool(influence_trace_cfg.get("fsync", False)),
         )
 
         self.global_steps = 0
@@ -326,11 +420,42 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        if bool(influence_trace_cfg.get("enable", False)):
+                            selected_num, selected_prompts, selected_debug = _prepare_influence_trace_batch(
+                                batch,
+                                world_size=self.actor_rollout_wg.world_size,
+                                max_prompts_per_step=int(influence_trace_cfg.get("max_prompts_per_step", 2)),
+                            )
+                            metrics["influence_trace/selected_responses"] = selected_num
+                            metrics["influence_trace/selected_prompts"] = selected_prompts
+                            metrics["influence_trace/uid_total"] = float(selected_debug["uid_total"])
+                            metrics["influence_trace/uid_constant"] = float(selected_debug["uid_constant"])
+                            metrics["influence_trace/uid_mixed"] = float(selected_debug["uid_mixed"])
+                            metrics["influence_trace/uid_cross_rank"] = float(selected_debug["uid_cross_rank"])
+                            batch.meta_info["influence_trace_cfg"] = {
+                                "enable": True,
+                                "reg_lambda": float(influence_trace_cfg.get("reg_lambda", -1.0)),
+                                "module_name_filter": list(influence_trace_cfg.get("module_name_filter", ["self_attn.o_proj", "mlp.down_proj"])),
+                                "max_modules": int(influence_trace_cfg.get("max_modules", 1)),
+                                "max_proj_vector_sum": int(influence_trace_cfg.get("max_proj_vector_sum", 64)),
+                                "max_hessian_dim": int(influence_trace_cfg.get("max_hessian_dim", 2500)),
+                            }
+                        else:
+                            batch.meta_info["influence_trace_cfg"] = {"enable": False}
                         # update actor
                         with _timer("update_actor", timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if bool(influence_trace_cfg.get("enable", False)):
+                            influence_rows = actor_output.non_tensor_batch.get("influence_trace_rows")
+                            influence_trace_writer.write_step(
+                                step=self.global_steps,
+                                batch=batch,
+                                entropies=entropys,
+                                response_mask=response_masks,
+                                influence_rows=influence_rows,
+                            )
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):

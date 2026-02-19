@@ -20,7 +20,7 @@ Single Process Actor
 import itertools
 import logging
 import os
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.influence_trace import InfluenceTraceConfig, TokenInfluenceTracer
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -78,8 +79,44 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self._influence_cfg: InfluenceTraceConfig | None = None
+        self._influence_tracer: TokenInfluenceTracer | None = None
+        self._influence_rows: list[dict[str, Any]] = []
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def pop_influence_trace_rows(self) -> list[dict[str, Any]]:
+        rows = self._influence_rows
+        self._influence_rows = []
+        return rows
+
+    def _setup_influence_trace(self, meta_info: dict[str, Any]) -> bool:
+        cfg = InfluenceTraceConfig.from_meta(meta_info)
+        self._influence_cfg = cfg
+        if not cfg.enable:
+            self._influence_tracer = None
+            return False
+        if not self.use_remove_padding:
+            raise ValueError("influence_trace requires actor_rollout_ref.model.use_remove_padding=True")
+        if self.use_ulysses_sp:
+            raise ValueError("influence_trace does not support ulysses sequence parallelism yet")
+        if self._influence_tracer is None:
+            self._influence_tracer = TokenInfluenceTracer(cfg)
+            self._influence_tracer.register(self.actor_module)
+            mem_map = self._influence_tracer.estimate_hessian_memory_mb()
+            if torch.distributed.get_rank() == 0 and mem_map:
+                msg = ", ".join([f"{k}: {v:.2f}MB" for k, v in mem_map.items()])
+                print(f"[influence_trace] Hessian peak estimate (2xD^2 fp32): {msg}")
+        else:
+            self._influence_tracer.cfg = cfg
+        self._influence_tracer.clear_storage()
+        return True
+
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        influence_payload: dict[str, torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -103,6 +140,20 @@ class DataParallelPPOActor(BasePPOActor):
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                if influence_payload is not None:
+                    tracer = self._influence_tracer
+                    if tracer is None:
+                        raise ValueError("influence_payload is provided but influence tracer is not initialized.")
+                    tracer.begin_rmpad_capture(
+                        indices=indices,
+                        batch_size=batch_size,
+                        seqlen=seqlen,
+                        response_mask=influence_payload["response_mask"],
+                        selected_rows=influence_payload["selected_rows"],
+                        row_ids=influence_payload["row_ids"],
+                        group_ids=influence_payload["group_ids"],
+                        accepted=influence_payload["accepted"],
+                    )
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
@@ -329,11 +380,24 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        self._influence_rows = []
+        influence_enabled = self._setup_influence_trace(data.meta_info)
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        influence_keys = [
+            "influence_trace_selected",
+            "influence_trace_group_id",
+            "influence_trace_row_id",
+            "influence_trace_accepted",
+            "influence_trace_reward",
+        ]
+        if influence_enabled:
+            for key in influence_keys:
+                if key in data.batch.keys():
+                    select_keys.append(key)
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -397,7 +461,23 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = True
                     # if entropy_coeff != 0:
                     #     calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    influence_payload = None
+                    if influence_enabled and epoch == 0 and "influence_trace_selected" in data:
+                        selected_rows = data["influence_trace_selected"].bool()
+                        if bool(selected_rows.any().item()):
+                            influence_payload = {
+                                "selected_rows": selected_rows,
+                                "response_mask": response_mask.bool(),
+                                "row_ids": data["influence_trace_row_id"].to(torch.long),
+                                "group_ids": data["influence_trace_group_id"].to(torch.long),
+                                "accepted": data["influence_trace_accepted"].bool(),
+                            }
+                    entropy, log_prob = self._forward_micro_batch(
+                        micro_batch=data,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        influence_payload=influence_payload,
+                    )
 
                     # high entropy token mask
                     with torch.no_grad():
@@ -476,6 +556,10 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
+                    if influence_payload is not None:
+                        tracer = self._influence_tracer
+                        if tracer is not None:
+                            tracer.end_microbatch()
 
                     if self.config.get("use_archer_policy_loss", False):
                         data = {
@@ -501,5 +585,7 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
+        if influence_enabled and self._influence_tracer is not None:
+            self._influence_rows = self._influence_tracer.pop_token_influence_rows()
         self.actor_optimizer.zero_grad()
         return metrics

@@ -22,6 +22,7 @@ import warnings
 from dataclasses import asdict
 from typing import Union
 
+import numpy as np
 import psutil
 import torch
 import torch.distributed
@@ -612,7 +613,11 @@ class ActorRolloutRefWorker(Worker):
             self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
+            influence_rows = self.actor.pop_influence_trace_rows()
+            output = DataProto(
+                meta_info={"metrics": metrics},
+                non_tensor_batch={"influence_trace_rows": np.array(influence_rows, dtype=object)},
+            )
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to("cpu")

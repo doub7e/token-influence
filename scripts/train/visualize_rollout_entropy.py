@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trace-dir",
         type=str,
-        default="output/Archer2.0/Archer2.0-Qwen2.5-1.5B-Math-EntropyTrace-v9/entropy_trace",
+        default="output/Archer2.0/Archer2.0-Qwen2.5-1.5B-Math-InfluenceTrace/influence_trace",
         help="Directory that contains manifest.jsonl and steps/*.npz",
     )
     parser.add_argument(
@@ -95,6 +95,34 @@ def _decode_token(tokenizer, token_id: int) -> str:
     return text
 
 
+def _decode_ids(tokenizer, token_ids: Any) -> str:
+    if tokenizer is None:
+        return str(token_ids)
+    if token_ids is None:
+        return ""
+    if isinstance(token_ids, np.ndarray):
+        ids = token_ids.tolist()
+    else:
+        ids = token_ids
+    if isinstance(ids, str):
+        ids = ids.strip()
+        if not ids or ids == "[]":
+            return "(prompt IDs not saved in this trace)"
+        try:
+            ids = json.loads(ids)
+        except (json.JSONDecodeError, ValueError):
+            return ids
+    if not isinstance(ids, (list, tuple)):
+        return str(ids)
+    if len(ids) == 0:
+        return "(prompt IDs not saved in this trace)"
+    try:
+        ids = [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return str(ids)
+    return tokenizer.decode(ids, skip_special_tokens=False)
+
+
 def _entropy_to_rgb(val: float, lo: float, hi: float) -> str:
     if not np.isfinite(val):
         return "rgb(120,120,120)"
@@ -109,7 +137,27 @@ def _entropy_to_rgb(val: float, lo: float, hi: float) -> str:
     return f"rgb({r},{g},{b})"
 
 
-def _render_token_heatmap(df: pd.DataFrame, lo: float, hi: float) -> str:
+def _influence_to_rgb(val: float, bound: float) -> str:
+    """Diverging colormap: blue (negative) → white (zero) → red (positive)."""
+    if not np.isfinite(val):
+        return "rgb(140,140,140)"
+    if bound <= 0:
+        bound = 1e-6
+    p = float(np.clip((val + bound) / (2.0 * bound), 0.0, 1.0))
+    if p < 0.5:
+        t = p / 0.5
+        r = int(40 + t * 215)
+        g = int(40 + t * 215)
+        b = int(210)
+    else:
+        t = (p - 0.5) / 0.5
+        r = int(210)
+        g = int(255 - t * 215)
+        b = int(255 - t * 215)
+    return f"rgb({r},{g},{b})"
+
+
+def _render_token_heatmap(df: pd.DataFrame, lo: float, hi: float, influence_bound: float | None = None) -> str:
     if df.empty:
         return "<div style='padding:12px'>No tokens after filtering.</div>"
 
@@ -121,7 +169,15 @@ def _render_token_heatmap(df: pd.DataFrame, lo: float, hi: float) -> str:
         valid = bool(row.valid)
         bg = _entropy_to_rgb(entropy, lo, hi) if valid else "rgb(100,100,100)"
         fg = "white" if valid else "rgb(200,200,200)"
-        tooltip = html.escape(f"pos={pos} id={int(row.token_id)} entropy={entropy:.5f} valid={valid}")
+        influence_val = float(getattr(row, "influence", float("nan")))
+        if influence_bound is not None and np.isfinite(influence_val):
+            bg = _influence_to_rgb(influence_val, influence_bound) if valid else "rgb(100,100,100)"
+            if valid:
+                inf_p = float(np.clip((influence_val + influence_bound) / (2.0 * influence_bound), 0.0, 1.0))
+                fg = "#333" if 0.3 < inf_p < 0.7 else "white"
+        tooltip = html.escape(
+            f"pos={pos} id={int(row.token_id)} entropy={entropy:.5f} influence={influence_val:.5f} valid={valid}"
+        )
         chunks.append(
             f"<span title='{tooltip}' style='display:inline-block;margin:2px;padding:4px 6px;border-radius:6px;"
             f"background:{bg};color:{fg};font-family:monospace;font-size:12px'>{token}</span>"
@@ -138,6 +194,17 @@ def _compute_step_stats(ent: np.ndarray, mask: np.ndarray) -> str:
         f"responses={ent.shape[0]}, response_len={ent.shape[1]}, valid_tokens={mask.sum()}  \n"
         f"entropy_mean={valid.mean():.6f}, std={valid.std():.6f}, min={valid.min():.6f}, max={valid.max():.6f}  \n"
         f"p50={p50:.6f}, p90={p90:.6f}, p99={p99:.6f}"
+    )
+
+
+def _compute_influence_stats(inf: np.ndarray, mask: np.ndarray) -> str:
+    valid = inf[np.isfinite(inf) & mask]
+    if valid.size == 0:
+        return "influence: none"
+    p50, p90, p99 = np.quantile(valid, [0.5, 0.9, 0.99])
+    return (
+        f"influence_mean={valid.mean():.6f}, std={valid.std():.6f}, min={valid.min():.6f}, max={valid.max():.6f}  \n"
+        f"influence_p50={p50:.6f}, influence_p90={p90:.6f}, influence_p99={p99:.6f}"
     )
 
 
@@ -176,6 +243,7 @@ def _flatten_topk(
 
 def _build_response_df(
     ent: np.ndarray,
+    influence: np.ndarray | None,
     mask: np.ndarray,
     responses: np.ndarray,
     tokenizer,
@@ -206,6 +274,7 @@ def _build_response_df(
                 "token_id": int(tid),
                 "token": tok,
                 "entropy": float(e),
+                "influence": float(influence[response_idx, pos]) if influence is not None else float("nan"),
                 "valid": bool(valid),
             }
         )
@@ -273,6 +342,7 @@ def main() -> None:
         step_path = Path(trace_dir_str).expanduser().resolve() / rec["file"]
         payload = _load_step_npz(str(step_path))
         ent = payload["entropies"].astype(np.float32)
+        influence = payload["influence"].astype(np.float32) if "influence" in payload else None
         mask = payload["response_mask"].astype(bool)
         responses = payload["responses"].astype(np.int32)
         valid = ent[mask]
@@ -292,9 +362,22 @@ def main() -> None:
             overview["sample_index"] = payload["sample_index"]
         if "uid" in payload:
             overview["uid"] = payload["uid"]
+        if "reward" in payload:
+            overview["reward"] = payload["reward"]
+        if "accepted" in payload:
+            overview["accepted"] = payload["accepted"]
+        if "group_id" in payload:
+            overview["group_id"] = payload["group_id"]
+        if influence is not None:
+            valid_inf = np.isfinite(influence) & mask
+            influence_mean = np.where(valid_inf.sum(axis=1) > 0, np.where(valid_inf, influence, 0.0).sum(axis=1) / np.maximum(valid_inf.sum(axis=1), 1), np.nan)
+            overview["influence_mean"] = influence_mean
 
+        step_stats = _compute_step_stats(ent, mask)
+        if influence is not None:
+            step_stats = step_stats + "  \n" + _compute_influence_stats(influence, mask)
         return (
-            _compute_step_stats(ent, mask),
+            step_stats,
             gr.Slider(minimum=0, maximum=max(ent.shape[0] - 1, 0), value=0, step=1),
             lo,
             hi,
@@ -315,16 +398,17 @@ def main() -> None:
         sort_by: str,
     ):
         if not records:
-            return "<div>Load trace first.</div>", pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            return "<div>Load trace first.</div>", "N/A", "N/A", pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         if step is None:
-            return "<div>Select a step first.</div>", pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            return "<div>Select a step first.</div>", "N/A", "N/A", pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         rec = next((x for x in records if int(x["step"]) == int(step)), None)
         if rec is None:
-            return "<div>Step not found.</div>", pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            return "<div>Step not found.</div>", "N/A", "N/A", pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
         step_path = Path(trace_dir_str).expanduser().resolve() / rec["file"]
         payload = _load_step_npz(str(step_path))
         ent = payload["entropies"].astype(np.float32)
+        influence = payload["influence"].astype(np.float32) if "influence" in payload else None
         mask = payload["response_mask"].astype(bool)
         responses = payload["responses"].astype(np.int32)
         response_idx = int(np.clip(response_idx, 0, max(ent.shape[0] - 1, 0)))
@@ -337,6 +421,7 @@ def main() -> None:
 
         df = _build_response_df(
             ent=ent,
+            influence=influence,
             mask=mask,
             responses=responses,
             tokenizer=tokenizer,
@@ -351,10 +436,38 @@ def main() -> None:
         valid = ent[mask]
         lo = float(valid.min()) if valid.size else 0.0
         hi = float(valid.max()) if valid.size else 1.0
-        token_html = _render_token_heatmap(df if sort_by == "position" else df.sort_values("position"), lo, hi)
+        view_df = df if sort_by == "position" else df.sort_values("position")
+        entropy_html = _render_token_heatmap(view_df, lo, hi, influence_bound=None)
+        influence_html = "<div style='padding:12px'>No influence in this trace step.</div>"
+        if influence is not None:
+            finite_inf = influence[np.isfinite(influence) & mask]
+            if finite_inf.size:
+                inf_bound = float(np.quantile(np.abs(finite_inf), 0.99))
+                if inf_bound < 1e-8:
+                    inf_bound = float(np.max(np.abs(finite_inf)))
+            else:
+                inf_bound = 1.0
+            influence_html = _render_token_heatmap(view_df, lo, hi, influence_bound=inf_bound)
+        token_html = (
+            "<div style='display:flex;gap:16px'>"
+            "<div style='flex:1'><h4>Entropy</h4>" + entropy_html + "</div>"
+            "<div style='flex:1'><h4>Influence</h4>" + influence_html + "</div>"
+            "</div>"
+        )
+        prompt_preview = "N/A"
+        if "prompt_ids" in payload:
+            prompt_preview = _decode_ids(tokenizer, payload["prompt_ids"][response_idx])
+        response_meta = []
+        if "reward" in payload:
+            response_meta.append(f"reward={float(payload['reward'][response_idx]):.4f}")
+        if "accepted" in payload:
+            response_meta.append("accepted" if bool(payload["accepted"][response_idx]) else "rejected")
+        if "group_id" in payload:
+            response_meta.append(f"group_id={int(payload['group_id'][response_idx])}")
+        response_meta_text = ", ".join(response_meta) if response_meta else "N/A"
         high_df = _flatten_topk(ent, mask, responses, tokenizer, int(top_k), highest=True)
         low_df = _flatten_topk(ent, mask, responses, tokenizer, int(top_k), highest=False)
-        return token_html, df, high_df, low_df
+        return token_html, prompt_preview, response_meta_text, df, high_df, low_df
 
     def export_selected_csv(
         records,
@@ -368,7 +481,7 @@ def main() -> None:
         include_invalid: bool,
         sort_by: str,
     ):
-        token_html, df, _, _ = inspect_response(
+        token_html, _, _, df, _, _ = inspect_response(
             records,
             trace_dir_str,
             model_path,
@@ -391,8 +504,8 @@ def main() -> None:
     with gr.Blocks(title="Archer Rollout Entropy Visualizer") as demo:
         gr.Markdown(
             """
-            # Archer Rollout Entropy Visualizer
-            Inspect token-level entropy for every rollout step and response.
+            # Archer Rollout Entropy + Influence Visualizer
+            Inspect token-level entropy/influence for every rollout step and response.
             """
         )
 
@@ -413,6 +526,8 @@ def main() -> None:
 
         step_stats_md = gr.Markdown()
         response_overview_df = gr.Dataframe(label="Response Overview (Current Step)", wrap=True, interactive=False)
+        prompt_md = gr.Textbox(label="Prompt (Decoded)", lines=6, interactive=False)
+        response_meta_md = gr.Textbox(label="Response Label", lines=1, interactive=False)
 
         with gr.Row():
             min_entropy = gr.Number(label="Min Entropy Filter", value=0.0)
@@ -429,7 +544,7 @@ def main() -> None:
             export_btn = gr.Button("Export Selected Response CSV")
 
         export_file = gr.File(label="Exported CSV", interactive=False, visible=False)
-        token_html = gr.HTML(label="Selected Response Token Entropy Heatmap")
+        token_html = gr.HTML(label="Selected Response Token Heatmaps")
         token_df = gr.Dataframe(label="Selected Response Token Table", wrap=True, interactive=False)
 
         with gr.Row():
@@ -440,12 +555,6 @@ def main() -> None:
             fn=load_trace,
             inputs=[trace_dir_tb, model_path_tb],
             outputs=[load_status, records_state, step_dd, manifest_df],
-        )
-
-        step_dd.change(
-            fn=on_step_selected,
-            inputs=[records_state, trace_dir_tb, step_dd],
-            outputs=[step_stats_md, response_slider, min_entropy, max_entropy, response_overview_df],
         )
 
         inspect_inputs = [
@@ -461,9 +570,13 @@ def main() -> None:
             top_k,
             sort_by,
         ]
-        inspect_outputs = [token_html, token_df, high_df, low_df]
+        inspect_outputs = [token_html, prompt_md, response_meta_md, token_df, high_df, low_df]
 
-        step_dd.change(fn=inspect_response, inputs=inspect_inputs, outputs=inspect_outputs)
+        step_dd.change(
+            fn=on_step_selected,
+            inputs=[records_state, trace_dir_tb, step_dd],
+            outputs=[step_stats_md, response_slider, min_entropy, max_entropy, response_overview_df],
+        ).then(fn=inspect_response, inputs=inspect_inputs, outputs=inspect_outputs)
         response_slider.change(fn=inspect_response, inputs=inspect_inputs, outputs=inspect_outputs)
         min_entropy.change(fn=inspect_response, inputs=inspect_inputs, outputs=inspect_outputs)
         max_entropy.change(fn=inspect_response, inputs=inspect_inputs, outputs=inspect_outputs)
