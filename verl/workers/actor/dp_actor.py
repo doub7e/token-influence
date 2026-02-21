@@ -20,6 +20,7 @@ Single Process Actor
 import itertools
 import logging
 import os
+import time
 from typing import Any, Tuple
 
 import torch
@@ -103,12 +104,44 @@ class DataParallelPPOActor(BasePPOActor):
             self._influence_tracer.register(self.actor_module)
             mem_map = self._influence_tracer.estimate_hessian_memory_mb()
             if torch.distributed.get_rank() == 0 and mem_map:
-                msg = ", ".join([f"{k}: {v:.2f}MB" for k, v in mem_map.items()])
-                print(f"[influence_trace] Hessian peak estimate (2xD^2 fp32): {msg}")
+                report = self._influence_tracer.projection_report()
+                print(
+                    "[influence_trace] projection setup: "
+                    f"hessian_mode={cfg.hessian_mode}, factor={cfg.projection_dim_factor}, max_modules={cfg.max_modules}, "
+                    f"max_proj_vector_sum={cfg.max_proj_vector_sum}, max_hessian_dim={cfg.max_hessian_dim}, "
+                    f"max_tokens_per_response={cfg.max_tokens_per_response}, "
+                    f"skip_optimizer_step={cfg.skip_optimizer_step}, "
+                    f"grad_offload_to_cpu={cfg.grad_offload_to_cpu}, output_function={cfg.output_function}, "
+                    f"accepted_rejected_scope={cfg.accepted_rejected_scope}"
+                )
+                for row in report:
+                    print(
+                        "[influence_trace] module="
+                        f"{row['name']}, in={row['in_features']}, out={row['out_features']}, "
+                        f"k_in={row['k_in']}, k_out={row['k_out']}, D={row['proj_dim']}, "
+                        f"hessian_peak_mb={row['hessian_peak_mb']:.2f}"
+                    )
+                total_mb = float(sum(mem_map.values()))
+                print(f"[influence_trace] Hessian peak estimate total (2xD^2 fp32): {total_mb:.2f}MB")
         else:
             self._influence_tracer.cfg = cfg
         self._influence_tracer.clear_storage()
         return True
+
+    def _compute_log_prob_advantage_objective(
+        self,
+        *,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        loss_agg_mode: str,
+    ) -> torch.Tensor:
+        obj = agg_loss(loss_mat=log_prob * advantages, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        if self.config.use_dynamic_bsz:
+            obj = obj * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
+        else:
+            obj = obj / self.gradient_accumulation
+        return obj
 
     def _forward_micro_batch(
         self,
@@ -294,6 +327,10 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        trace_profile = bool(self._influence_cfg is not None and self._influence_cfg.profile_timing)
+        is_rank0 = (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if trace_profile and is_rank0:
+            print("[influence_trace][optimizer] clip_start")
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
@@ -301,6 +338,14 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        if trace_profile and is_rank0:
+            print("[influence_trace][optimizer] clip_done")
+
+        if self._influence_cfg is not None and self._influence_cfg.skip_optimizer_step:
+            if trace_profile and is_rank0:
+                print("[influence_trace][optimizer] step_skipped")
+                print("[influence_trace][optimizer] step_done")
+            return grad_norm
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
@@ -308,6 +353,8 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.zero_grad()
         else:
             self.actor_optimizer.step()
+        if trace_profile and is_rank0:
+            print("[influence_trace][optimizer] step_done")
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -415,6 +462,27 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        profile_influence_timing = (
+            influence_enabled
+            and self._influence_cfg is not None
+            and bool(getattr(self._influence_cfg, "profile_timing", False))
+        )
+        influence_timing = {
+            "logprob_backward": 0.0,
+            "loss_backward": 0.0,
+            "pop_rows": 0.0,
+            "forward_1": 0.0,
+            "forward_2": 0.0,
+        }
+        saw_influence_payload = False
+
+        def _sync_for_timing():
+            if profile_influence_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def _rank0() -> bool:
+            return (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -433,7 +501,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for data in micro_batches:
+                for micro_idx, data in enumerate(micro_batches):
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
@@ -465,19 +533,75 @@ class DataParallelPPOActor(BasePPOActor):
                     if influence_enabled and epoch == 0 and "influence_trace_selected" in data:
                         selected_rows = data["influence_trace_selected"].bool()
                         if bool(selected_rows.any().item()):
-                            influence_payload = {
-                                "selected_rows": selected_rows,
-                                "response_mask": response_mask.bool(),
-                                "row_ids": data["influence_trace_row_id"].to(torch.long),
-                                "group_ids": data["influence_trace_group_id"].to(torch.long),
-                                "accepted": data["influence_trace_accepted"].bool(),
-                            }
+                            saw_influence_payload = True
+                        influence_payload = {
+                            "selected_rows": selected_rows,
+                            "response_mask": response_mask.bool(),
+                            "row_ids": data["influence_trace_row_id"].to(torch.long),
+                            "group_ids": data["influence_trace_group_id"].to(torch.long),
+                            "accepted": data["influence_trace_accepted"].bool(),
+                        }
+                    influence_cfg = self._influence_cfg
+                    capture_with_training_backward = (
+                        influence_payload is not None and influence_cfg is not None and influence_cfg.output_function == "training_loss"
+                    )
+                    capture_with_logprob_backward = (
+                        influence_payload is not None and influence_cfg is not None and influence_cfg.output_function == "log_prob_advantage"
+                    )
+                    capture_with_influence_backward = capture_with_training_backward or capture_with_logprob_backward
+                    if profile_influence_timing and _rank0():
+                        sel_rows = int(influence_payload["selected_rows"].sum().item()) if influence_payload is not None else 0
+                        print(
+                            f"[influence_trace][micro] idx={micro_idx} "
+                            f"capture_train={int(capture_with_training_backward)} "
+                            f"capture_logprob={int(capture_with_logprob_backward)} "
+                            f"selected_rows={sel_rows}"
+                        )
+                    _sync_for_timing()
+                    t_forward_1 = time.perf_counter()
                     entropy, log_prob = self._forward_micro_batch(
                         micro_batch=data,
                         temperature=temperature,
                         calculate_entropy=calculate_entropy,
-                        influence_payload=influence_payload,
+                        influence_payload=influence_payload if capture_with_influence_backward else None,
                     )
+                    _sync_for_timing()
+                    influence_timing["forward_1"] += time.perf_counter() - t_forward_1
+                    if capture_with_logprob_backward:
+                        tracer = self._influence_tracer
+                        if tracer is None:
+                            raise ValueError("influence_payload is provided but influence tracer is not initialized.")
+                        influence_obj = self._compute_log_prob_advantage_objective(
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        anchor_param = tracer.anchor_parameter()
+                        if anchor_param is not None:
+                            _sync_for_timing()
+                            t_logprob_bw = time.perf_counter()
+                            torch.autograd.backward(
+                                influence_obj,
+                                inputs=[anchor_param],
+                                retain_graph=False,
+                            )
+                            if anchor_param.grad is not None:
+                                anchor_param.grad = None
+                            _sync_for_timing()
+                            influence_timing["logprob_backward"] += time.perf_counter() - t_logprob_bw
+                        tracer.end_microbatch()
+                        # Build a fresh graph for the real training backward.
+                        _sync_for_timing()
+                        t_forward_2 = time.perf_counter()
+                        entropy, log_prob = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            influence_payload=None,
+                        )
+                        _sync_for_timing()
+                        influence_timing["forward_2"] += time.perf_counter() - t_forward_2
 
                     # high entropy token mask
                     with torch.no_grad():
@@ -555,8 +679,12 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
+                    _sync_for_timing()
+                    t_loss_bw = time.perf_counter()
                     loss.backward()
-                    if influence_payload is not None:
+                    _sync_for_timing()
+                    influence_timing["loss_backward"] += time.perf_counter() - t_loss_bw
+                    if capture_with_training_backward:
                         tracer = self._influence_tracer
                         if tracer is not None:
                             tracer.end_microbatch()
@@ -582,10 +710,63 @@ class DataParallelPPOActor(BasePPOActor):
 
                     append_to_dict(metrics, data)
 
+                if profile_influence_timing and _rank0():
+                    print("[influence_trace][phase] before_optimizer_step")
                 grad_norm = self._optimizer_step()
-                data = {"actor/grad_norm": grad_norm.detach().item()}
+                if profile_influence_timing and _rank0():
+                    print("[influence_trace][phase] after_optimizer_step")
+                if self._influence_cfg is not None and self._influence_cfg.skip_optimizer_step:
+                    grad_norm_value = float("nan")
+                elif torch.is_tensor(grad_norm):
+                    grad_norm_value = float(grad_norm.detach().cpu().item())
+                else:
+                    grad_norm_value = float(grad_norm)
+                data = {"actor/grad_norm": grad_norm_value}
                 append_to_dict(metrics, data)
         if influence_enabled and self._influence_tracer is not None:
+            if profile_influence_timing and _rank0():
+                print("[influence_trace][phase] before_pop_rows")
+            _sync_for_timing()
+            t_pop_rows = time.perf_counter()
             self._influence_rows = self._influence_tracer.pop_token_influence_rows()
+            _sync_for_timing()
+            influence_timing["pop_rows"] += time.perf_counter() - t_pop_rows
+            if profile_influence_timing and _rank0():
+                print(f"[influence_trace][phase] after_pop_rows rows={len(self._influence_rows)}")
+            rows_emitted = float(len(self._influence_rows))
+            append_to_dict(metrics, {"influence_trace/rows_emitted": rows_emitted})
+            dbg = self._influence_tracer.debug_stats(reset=True)
+            append_to_dict(
+                metrics,
+                {
+                    "influence_trace/debug_capture_begin_calls": float(dbg.get("capture_begin_calls", 0)),
+                    "influence_trace/debug_capture_begin_nonempty": float(dbg.get("capture_begin_nonempty", 0)),
+                    "influence_trace/debug_capture_selected_tokens": float(dbg.get("capture_selected_tokens", 0)),
+                    "influence_trace/debug_anchor_tensor_ready": float(dbg.get("anchor_tensor_ready", 0)),
+                    "influence_trace/debug_forward_capture_calls": float(dbg.get("forward_capture_calls", 0)),
+                    "influence_trace/debug_forward_set_v_calls": float(dbg.get("forward_set_v_calls", 0)),
+                    "influence_trace/debug_backward_hook_calls": float(dbg.get("backward_hook_calls", 0)),
+                    "influence_trace/debug_output_grad_hook_calls": float(dbg.get("output_grad_hook_calls", 0)),
+                    "influence_trace/debug_stored_chunks": float(dbg.get("stored_chunks", 0)),
+                    "influence_trace/debug_groups_total": float(dbg.get("groups_total", 0)),
+                    "influence_trace/debug_groups_skipped_all_same": float(dbg.get("groups_skipped_all_same", 0)),
+                },
+            )
+            if saw_influence_payload and rows_emitted == 0.0 and torch.distributed.get_rank() == 0:
+                print(
+                    "[influence_trace][warn] selected_rows were present but no influence rows were emitted. "
+                    f"debug={dbg}"
+                )
+        if profile_influence_timing:
+            append_to_dict(
+                metrics,
+                {
+                    "timing_s/influence_forward_1": influence_timing["forward_1"],
+                    "timing_s/influence_forward_2": influence_timing["forward_2"],
+                    "timing_s/influence_logprob_backward": influence_timing["logprob_backward"],
+                    "timing_s/influence_loss_backward": influence_timing["loss_backward"],
+                    "timing_s/influence_pop_rows": influence_timing["pop_rows"],
+                },
+            )
         self.actor_optimizer.zero_grad()
         return metrics
