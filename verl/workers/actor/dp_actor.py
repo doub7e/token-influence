@@ -757,6 +757,17 @@ class DataParallelPPOActor(BasePPOActor):
                     "[influence_trace][warn] selected_rows were present but no influence rows were emitted. "
                     f"debug={dbg}"
                 )
+            if profile_influence_timing:
+                timing = self._influence_tracer.pop_timing(reset=True)
+                append_to_dict(
+                    metrics,
+                    {
+                        "timing_s/influence_grad_staging": timing.get("grad_staging_s", 0.0),
+                        "timing_s/influence_hessian_solve": timing.get("hessian_solve_s", 0.0),
+                        "timing_s/influence_token_scoring": timing.get("token_scoring_s", 0.0),
+                        "timing_s/influence_score_aggregation": timing.get("score_aggregation_s", 0.0),
+                    },
+                )
         if profile_influence_timing:
             append_to_dict(
                 metrics,

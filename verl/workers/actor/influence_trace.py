@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -122,7 +123,9 @@ class TokenInfluenceTracer:
         self._store_enabled: bool = True
         self._compute_mode_logged = False
         self._debug: dict[str, int] = {}
+        self._timing: dict[str, float] = {}
         self._reset_debug()
+        self._reset_timing()
 
     def _reset_debug(self) -> None:
         self._debug = {
@@ -137,6 +140,14 @@ class TokenInfluenceTracer:
             "stored_chunks": 0,
             "groups_total": 0,
             "groups_skipped_all_same": 0,
+        }
+
+    def _reset_timing(self) -> None:
+        self._timing = {
+            "grad_staging_s": 0.0,
+            "hessian_solve_s": 0.0,
+            "token_scoring_s": 0.0,
+            "score_aggregation_s": 0.0,
         }
 
     def _pick_projection_dims(self, in_features: int, out_features: int) -> tuple[int, int]:
@@ -488,6 +499,12 @@ class TokenInfluenceTracer:
             self._reset_debug()
         return out
 
+    def pop_timing(self, *, reset: bool = True) -> dict[str, float]:
+        out = dict(self._timing)
+        if reset:
+            self._reset_timing()
+        return out
+
     def _compute_kernel_solve(
         self,
         g_resp: torch.Tensor,
@@ -598,13 +615,24 @@ class TokenInfluenceTracer:
                 torch.empty(0, device="cpu", dtype=torch.float32),
                 0,
             )
+        do_timing = self.cfg.profile_timing and torch.cuda.is_available()
+
+        def _sync() -> None:
+            if do_timing:
+                torch.cuda.synchronize()
+
         compute_device = self._module_compute_device(module_name)
+        _sync()
+        t_stage = time.perf_counter()
         u = self._cat_and_stage(bucket["u"], device=compute_device, dtype=torch.float32)
         v = self._cat_and_stage(bucket["v"], device=compute_device, dtype=torch.float32)
         row_id = self._cat_and_stage(bucket["row_id"], device=compute_device, dtype=torch.int64)
         token_pos = self._cat_and_stage(bucket["token_pos"], device=compute_device, dtype=torch.int64)
         group_id = self._cat_and_stage(bucket["group_id"], device=compute_device, dtype=torch.int64)
         accepted = self._cat_and_stage(bucket["accepted"], device=compute_device, dtype=torch.bool)
+        _sync()
+        self._timing["grad_staging_s"] += time.perf_counter() - t_stage
+
         if not self._compute_mode_logged and self._is_rank0():
             print(
                 "[influence_trace] runtime compute="
@@ -632,6 +660,8 @@ class TokenInfluenceTracer:
             v_g = v[g_mask]
             acc_g = accepted[g_mask]
             if self.cfg.hessian_mode == "identity":
+                _sync()
+                t_tok = time.perf_counter()
                 pair, score = self._module_token_scores_identity(
                     row_g=row_g,
                     tok_g=tok_g,
@@ -640,9 +670,13 @@ class TokenInfluenceTracer:
                     acc_g=acc_g,
                     stride=stride,
                 )
+                _sync()
+                self._timing["token_scoring_s"] += time.perf_counter() - t_tok
                 if pair.numel() == 0:
                     continue
             else:
+                _sync()
+                t_tok = time.perf_counter()
                 g_tok = torch.bmm(u_g.unsqueeze(2), v_g.unsqueeze(1)).reshape(u_g.shape[0], -1)
                 uniq_rows, inv = torch.unique(row_g, sorted=True, return_inverse=True)
                 g_resp = torch.zeros((uniq_rows.numel(), g_tok.shape[1]), device=g_tok.device, dtype=g_tok.dtype)
@@ -651,20 +685,45 @@ class TokenInfluenceTracer:
                 row_acc.index_put_((inv,), acc_g, accumulate=False)
                 if bool(row_acc.all().item()) or bool((~row_acc).all().item()):
                     self._debug["groups_skipped_all_same"] += 1
+                    _sync()
+                    self._timing["token_scoring_s"] += time.perf_counter() - t_tok
                     continue
+                _sync()
+                self._timing["token_scoring_s"] += time.perf_counter() - t_tok
+
+                _sync()
+                t_hess = time.perf_counter()
                 solved = self._compute_kernel_solve(g_resp=g_resp, g_tok=g_tok, reg_lambda=self.cfg.reg_lambda)
+                _sync()
+                self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
+
+                _sync()
+                t_tok2 = time.perf_counter()
                 infl = g_resp @ solved  # [n_resp, n_tokens]
                 score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
                 pair = row_g * stride + tok_g
+                _sync()
+                self._timing["token_scoring_s"] += time.perf_counter() - t_tok2
+
+            _sync()
+            t_agg = time.perf_counter()
             pair_out.append(pair)
             score_out.append(score)
+            _sync()
+            self._timing["score_aggregation_s"] += time.perf_counter() - t_agg
+
         if not pair_out:
             return (
                 torch.empty(0, device="cpu", dtype=torch.int64),
                 torch.empty(0, device="cpu", dtype=torch.float32),
                 response_len,
             )
-        return torch.cat(pair_out, dim=0), torch.cat(score_out, dim=0), response_len
+        _sync()
+        t_agg_final = time.perf_counter()
+        result = torch.cat(pair_out, dim=0), torch.cat(score_out, dim=0), response_len
+        _sync()
+        self._timing["score_aggregation_s"] += time.perf_counter() - t_agg_final
+        return result
 
     def pop_token_influence_rows(self) -> list[dict[str, Any]]:
         if not self.storage:
