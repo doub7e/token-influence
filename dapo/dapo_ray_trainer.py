@@ -65,6 +65,10 @@ def _prepare_influence_trace_batch(
     uid_constant = 0
     uid_mixed = 0
     uid_cross_rank = 0
+    prompt_cap = int(max_prompts_per_step)
+    if prompt_cap <= 0:
+        prompt_cap = -1  # no cap: keep all eligible prompts
+
     for uid, idx in uid_to_indices.items():
         if idx.size == 0:
             continue
@@ -82,7 +86,7 @@ def _prepare_influence_trace_batch(
             uid_cross_rank += 1
             continue
         selected_uid.append(uid)
-        if len(selected_uid) >= max_prompts_per_step:
+        if prompt_cap > 0 and len(selected_uid) >= prompt_cap:
             break
 
     selected_mask = np.zeros((batch_size,), dtype=np.bool_)
@@ -435,10 +439,32 @@ class RayDAPOTrainer(RayPPOTrainer):
                             batch.meta_info["influence_trace_cfg"] = {
                                 "enable": True,
                                 "reg_lambda": float(influence_trace_cfg.get("reg_lambda", -1.0)),
-                                "module_name_filter": list(influence_trace_cfg.get("module_name_filter", ["self_attn.o_proj", "mlp.down_proj"])),
-                                "max_modules": int(influence_trace_cfg.get("max_modules", 1)),
-                                "max_proj_vector_sum": int(influence_trace_cfg.get("max_proj_vector_sum", 64)),
+                                "hessian_mode": str(influence_trace_cfg.get("hessian_mode", "inverse")),
+                                "output_function": str(influence_trace_cfg.get("output_function", "training_loss")),
+                                "accepted_rejected_scope": str(influence_trace_cfg.get("accepted_rejected_scope", "per_prompt")),
+                                "module_name_filter": list(
+                                    influence_trace_cfg.get(
+                                        "module_name_filter",
+                                        [
+                                            "self_attn.q_proj",
+                                            "self_attn.k_proj",
+                                            "self_attn.v_proj",
+                                            "self_attn.o_proj",
+                                            "mlp.gate_proj",
+                                            "mlp.up_proj",
+                                            "mlp.down_proj",
+                                        ],
+                                    )
+                                ),
+                                "max_modules": int(influence_trace_cfg.get("max_modules", -1)),
+                                "projection_dim_factor": int(influence_trace_cfg.get("projection_dim_factor", 512)),
+                                "max_proj_vector_sum": int(influence_trace_cfg.get("max_proj_vector_sum", -1)),
                                 "max_hessian_dim": int(influence_trace_cfg.get("max_hessian_dim", 2500)),
+                                "max_tokens_per_response": int(influence_trace_cfg.get("max_tokens_per_response", -1)),
+                                "skip_optimizer_step": bool(influence_trace_cfg.get("skip_optimizer_step", False)),
+                                "grad_offload_to_cpu": bool(influence_trace_cfg.get("grad_offload_to_cpu", False)),
+                                "force_gpu_compute": bool(influence_trace_cfg.get("force_gpu_compute", True)),
+                                "profile_timing": bool(influence_trace_cfg.get("profile_timing", False)),
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}

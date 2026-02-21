@@ -138,22 +138,21 @@ def _entropy_to_rgb(val: float, lo: float, hi: float) -> str:
 
 
 def _influence_to_rgb(val: float, bound: float) -> str:
-    """Diverging colormap: blue (negative) → white (zero) → red (positive)."""
+    """Diverging colormap: deep blue (most negative) → white (zero) → deep red (most positive)."""
     if not np.isfinite(val):
         return "rgb(140,140,140)"
     if bound <= 0:
         bound = 1e-6
-    p = float(np.clip((val + bound) / (2.0 * bound), 0.0, 1.0))
-    if p < 0.5:
-        t = p / 0.5
-        r = int(40 + t * 215)
-        g = int(40 + t * 215)
-        b = int(210)
+    clamped = float(np.clip(val, -bound, bound))
+    t = abs(clamped) / bound
+    if clamped >= 0:
+        r = 255
+        g = int(255 * (1.0 - t))
+        b = int(255 * (1.0 - t))
     else:
-        t = (p - 0.5) / 0.5
-        r = int(210)
-        g = int(255 - t * 215)
-        b = int(255 - t * 215)
+        r = int(255 * (1.0 - t))
+        g = int(255 * (1.0 - t))
+        b = 255
     return f"rgb({r},{g},{b})"
 
 

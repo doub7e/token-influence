@@ -31,7 +31,7 @@
 ### Git
 | Field | Value |
 | --- | --- |
-| Commit | `TBD (this commit)` |
+| Commit | `88e2258` |
 | Branch | `main` |
 | Remote | `doub7e` |
 | Push | `Yes` |

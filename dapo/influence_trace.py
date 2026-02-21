@@ -32,6 +32,61 @@ def _to_unicode_array(value: Any) -> np.ndarray | None:
     return arr.astype(str)
 
 
+def _normalize_prompt_ids_item(item: Any) -> list[int]:
+    if item is None:
+        return []
+    if isinstance(item, torch.Tensor):
+        item = item.detach().cpu().tolist()
+    elif isinstance(item, np.ndarray):
+        item = item.tolist()
+    if isinstance(item, str):
+        text = item.strip()
+        if not text or text == "[]":
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return []
+        item = parsed
+    if isinstance(item, (list, tuple)):
+        try:
+            return [int(x) for x in item]
+        except Exception:
+            return []
+    return []
+
+
+def _extract_prompt_ids(
+    *,
+    batch,
+    response_mask: torch.Tensor,
+    selected_rows: np.ndarray,
+) -> np.ndarray:
+    prompt_ids_obj = batch.non_tensor_batch.get("raw_prompt_ids")
+    if prompt_ids_obj is not None:
+        arr = np.asarray(prompt_ids_obj, dtype=object)
+        if arr.shape[0] > int(selected_rows.max(initial=-1)):
+            prompt_ids = [_normalize_prompt_ids_item(arr[int(i)]) for i in selected_rows.tolist()]
+            return np.asarray(prompt_ids, dtype=object)
+
+    input_ids = batch.batch.get("input_ids")
+    attn_mask = batch.batch.get("attention_mask")
+    if input_ids is None or attn_mask is None:
+        return np.asarray([[] for _ in selected_rows.tolist()], dtype=object)
+
+    input_np = input_ids.detach().to(torch.int64).cpu().numpy()
+    attn_np = attn_mask.detach().to(torch.bool).cpu().numpy()
+    resp_np = response_mask.detach().to(torch.bool).cpu().numpy()[selected_rows]
+
+    prompt_ids: list[list[int]] = []
+    for i, row in enumerate(selected_rows.tolist()):
+        valid_ids = input_np[row][attn_np[row]]
+        resp_valid = int(resp_np[i].sum())
+        prompt_len = max(int(valid_ids.shape[0]) - resp_valid, 0)
+        prompt_ids.append(valid_ids[:prompt_len].astype(np.int32, copy=False).tolist())
+    return np.asarray(prompt_ids, dtype=object)
+
+
 class RolloutInfluenceTraceWriter:
     """Write one compressed influence record per rollout step."""
 
@@ -141,11 +196,7 @@ class RolloutInfluenceTraceWriter:
         uid = _to_unicode_array(batch.non_tensor_batch.get("uid"))
         uid_sel = uid[selected_rows] if uid is not None else None
         uid_hash = np.array([_uid_to_hash64(str(x)) for x in uid_sel], dtype=np.int64) if uid_sel is not None else None
-        prompt_ids_obj = batch.non_tensor_batch.get("raw_prompt_ids")
-        if prompt_ids_obj is None:
-            prompt_ids = np.array(["[]"] * len(selected_rows), dtype=object)
-        else:
-            prompt_ids = np.asarray(prompt_ids_obj, dtype=object)[selected_rows]
+        prompt_ids = _extract_prompt_ids(batch=batch, response_mask=response_mask, selected_rows=selected_rows)
         rewards = batch.batch["influence_trace_reward"].detach().to(torch.float32).cpu().numpy()[selected_rows]
         accepted = batch.batch["influence_trace_accepted"].detach().to(torch.bool).cpu().numpy()[selected_rows]
         group_ids = batch.batch["influence_trace_group_id"].detach().to(torch.int32).cpu().numpy()[selected_rows]

@@ -58,7 +58,8 @@ infer_ppo_max_token_len=$((max_prompt_length + v_max_response_length))
 offload=False
 
 # Actor
-use_archer_policy_loss=True
+# use_archer_policy_loss=True
+use_archer_policy_loss=False
 use_dynamic_clip=False
 token_entropy_quantile=0.8
 high_entropy_kl_loss_scale_coef=0.0

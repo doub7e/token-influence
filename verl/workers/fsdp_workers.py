@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import warnings
+from datetime import timedelta
 from dataclasses import asdict
 from typing import Union
 
@@ -73,6 +74,17 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _get_pg_timeout_seconds(default: int = 36000) -> int:
+    raw = os.environ.get("VERL_PG_TIMEOUT_SECONDS")
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+        return val if val > 0 else default
+    except ValueError:
+        return default
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -107,7 +119,12 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
-            torch.distributed.init_process_group(backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}", rank=rank, world_size=world_size)
+            torch.distributed.init_process_group(
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                rank=rank,
+                world_size=world_size,
+                timeout=timedelta(seconds=_get_pg_timeout_seconds()),
+            )
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -807,7 +824,7 @@ class CriticWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend=get_nccl_backend())
+            torch.distributed.init_process_group(backend=get_nccl_backend(), timeout=timedelta(seconds=_get_pg_timeout_seconds()))
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -1147,7 +1164,7 @@ class RewardModelWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend=get_nccl_backend())
+            torch.distributed.init_process_group(backend=get_nccl_backend(), timeout=timedelta(seconds=_get_pg_timeout_seconds()))
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
