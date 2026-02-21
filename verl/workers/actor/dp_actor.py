@@ -112,17 +112,8 @@ class DataParallelPPOActor(BasePPOActor):
                     f"max_tokens_per_response={cfg.max_tokens_per_response}, "
                     f"skip_optimizer_step={cfg.skip_optimizer_step}, "
                     f"grad_offload_to_cpu={cfg.grad_offload_to_cpu}, output_function={cfg.output_function}, "
-                    f"accepted_rejected_scope={cfg.accepted_rejected_scope}, retain_graph={cfg.retain_graph}"
+                    f"accepted_rejected_scope={cfg.accepted_rejected_scope}"
                 )
-                if cfg.retain_graph:
-                    import warnings
-                    warnings.warn(
-                        "[influence_trace] retain_graph=True is INCOMPATIBLE with FSDP. "
-                        "FSDP frees parameter storage after backward, so the retained graph's "
-                        "tensor references become dangling. Only use retain_graph=True when "
-                        "the model is NOT wrapped in FSDP.",
-                        stacklevel=1,
-                    )
                 for row in report:
                     print(
                         "[influence_trace] module="
@@ -587,35 +578,30 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=loss_agg_mode,
                         )
                         anchor_param = tracer.anchor_parameter()
-                        use_retain_graph = bool(
-                            influence_cfg is not None and getattr(influence_cfg, "retain_graph", False)
-                        )
                         if anchor_param is not None:
                             _sync_for_timing()
                             t_logprob_bw = time.perf_counter()
                             torch.autograd.backward(
                                 influence_obj,
                                 inputs=[anchor_param],
-                                retain_graph=use_retain_graph,
+                                retain_graph=False,
                             )
                             if anchor_param.grad is not None:
                                 anchor_param.grad = None
                             _sync_for_timing()
                             influence_timing["logprob_backward"] += time.perf_counter() - t_logprob_bw
                         tracer.end_microbatch()
-                        if not use_retain_graph:
-                            # Build a fresh graph for the real training backward.
-                            _sync_for_timing()
-                            t_forward_2 = time.perf_counter()
-                            entropy, log_prob = self._forward_micro_batch(
-                                micro_batch=data,
-                                temperature=temperature,
-                                calculate_entropy=calculate_entropy,
-                                influence_payload=None,
-                            )
-                            _sync_for_timing()
-                            influence_timing["forward_2"] += time.perf_counter() - t_forward_2
-                        # else: reuse entropy and log_prob from Forward 1 (graph retained)
+                        # Build a fresh graph for the real training backward.
+                        _sync_for_timing()
+                        t_forward_2 = time.perf_counter()
+                        entropy, log_prob = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            influence_payload=None,
+                        )
+                        _sync_for_timing()
+                        influence_timing["forward_2"] += time.perf_counter() - t_forward_2
 
                     # high entropy token mask
                     with torch.no_grad():

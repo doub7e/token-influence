@@ -59,7 +59,6 @@ class InfluenceTraceConfig:
     grad_offload_to_cpu: bool = False
     force_gpu_compute: bool = True
     profile_timing: bool = False
-    retain_graph: bool = False
 
     @staticmethod
     def from_meta(meta: dict[str, Any]) -> "InfluenceTraceConfig":
@@ -105,7 +104,6 @@ class InfluenceTraceConfig:
             grad_offload_to_cpu=bool(raw.get("grad_offload_to_cpu", False)),
             force_gpu_compute=bool(raw.get("force_gpu_compute", True)),
             profile_timing=bool(raw.get("profile_timing", False)),
-            retain_graph=bool(raw.get("retain_graph", False)),
         )
 
 

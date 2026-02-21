@@ -26,7 +26,6 @@ skip_optimizer_step="${INFLUENCE_SKIP_OPTIMIZER_STEP:-False}"
 grad_offload_to_cpu="${INFLUENCE_GRAD_OFFLOAD_TO_CPU:-False}"
 force_gpu_compute="${INFLUENCE_FORCE_GPU_COMPUTE:-True}"
 profile_timing="${INFLUENCE_PROFILE_TIMING:-False}"
-retain_graph="${INFLUENCE_RETAIN_GRAPH:-False}"
 
 mkdir -p "${ckpt_dir}" "${entropy_trace_dir}" "${influence_trace_dir}"
 
@@ -62,5 +61,4 @@ bash scripts/train/run_archer2.0_qwen2.5_1.5b_math.sh \
   +trainer.influence_trace.grad_offload_to_cpu="${grad_offload_to_cpu}" \
   +trainer.influence_trace.force_gpu_compute="${force_gpu_compute}" \
   +trainer.influence_trace.profile_timing="${profile_timing}" \
-  +trainer.influence_trace.retain_graph="${retain_graph}" \
   "$@"

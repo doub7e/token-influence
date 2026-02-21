@@ -465,7 +465,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "grad_offload_to_cpu": bool(influence_trace_cfg.get("grad_offload_to_cpu", False)),
                                 "force_gpu_compute": bool(influence_trace_cfg.get("force_gpu_compute", True)),
                                 "profile_timing": bool(influence_trace_cfg.get("profile_timing", False)),
-                                "retain_graph": bool(influence_trace_cfg.get("retain_graph", False)),
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}
