@@ -466,6 +466,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "force_gpu_compute": bool(influence_trace_cfg.get("force_gpu_compute", True)),
                                 "profile_timing": bool(influence_trace_cfg.get("profile_timing", False)),
                                 "exclude_self_response": bool(influence_trace_cfg.get("exclude_self_response", False)),
+                                "contrastive_agg": str(influence_trace_cfg.get("contrastive_agg", "sum")),
+                                "hessian_source": str(influence_trace_cfg.get("hessian_source", "response")),
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}

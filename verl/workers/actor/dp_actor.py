@@ -113,7 +113,8 @@ class DataParallelPPOActor(BasePPOActor):
                     f"skip_optimizer_step={cfg.skip_optimizer_step}, "
                     f"grad_offload_to_cpu={cfg.grad_offload_to_cpu}, output_function={cfg.output_function}, "
                     f"accepted_rejected_scope={cfg.accepted_rejected_scope}, "
-                    f"exclude_self_response={cfg.exclude_self_response}"
+                    f"exclude_self_response={cfg.exclude_self_response}, "
+                    f"contrastive_agg={cfg.contrastive_agg}, hessian_source={cfg.hessian_source}"
                 )
                 for row in report:
                     print(
@@ -138,6 +139,22 @@ class DataParallelPPOActor(BasePPOActor):
         loss_agg_mode: str,
     ) -> torch.Tensor:
         obj = agg_loss(loss_mat=log_prob * advantages, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        if self.config.use_dynamic_bsz:
+            obj = obj * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
+        else:
+            obj = obj / self.gradient_accumulation
+        return obj
+
+    def _compute_log_prob_reward_objective(
+        self,
+        *,
+        log_prob: torch.Tensor,
+        reward: torch.Tensor,
+        response_mask: torch.Tensor,
+        loss_agg_mode: str,
+    ) -> torch.Tensor:
+        # reward: [bsz] scalar reward per response (0 or 1 in math tasks)
+        obj = agg_loss(loss_mat=log_prob * reward.unsqueeze(-1), loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
         if self.config.use_dynamic_bsz:
             obj = obj * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
         else:
@@ -546,16 +563,18 @@ class DataParallelPPOActor(BasePPOActor):
                     capture_with_training_backward = (
                         influence_payload is not None and influence_cfg is not None and influence_cfg.output_function == "training_loss"
                     )
-                    capture_with_logprob_backward = (
-                        influence_payload is not None and influence_cfg is not None and influence_cfg.output_function == "log_prob_advantage"
+                    capture_with_separate_backward = (
+                        influence_payload is not None
+                        and influence_cfg is not None
+                        and influence_cfg.output_function in ("log_prob_advantage", "log_prob_reward")
                     )
-                    capture_with_influence_backward = capture_with_training_backward or capture_with_logprob_backward
+                    capture_with_influence_backward = capture_with_training_backward or capture_with_separate_backward
                     if profile_influence_timing and _rank0():
                         sel_rows = int(influence_payload["selected_rows"].sum().item()) if influence_payload is not None else 0
                         print(
                             f"[influence_trace][micro] idx={micro_idx} "
                             f"capture_train={int(capture_with_training_backward)} "
-                            f"capture_logprob={int(capture_with_logprob_backward)} "
+                            f"capture_separate={int(capture_with_separate_backward)} "
                             f"selected_rows={sel_rows}"
                         )
                     _sync_for_timing()
@@ -568,16 +587,25 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     _sync_for_timing()
                     influence_timing["forward_1"] += time.perf_counter() - t_forward_1
-                    if capture_with_logprob_backward:
+                    if capture_with_separate_backward:
                         tracer = self._influence_tracer
                         if tracer is None:
                             raise ValueError("influence_payload is provided but influence tracer is not initialized.")
-                        influence_obj = self._compute_log_prob_advantage_objective(
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            loss_agg_mode=loss_agg_mode,
-                        )
+                        if influence_cfg.output_function == "log_prob_advantage":
+                            influence_obj = self._compute_log_prob_advantage_objective(
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                        else:  # log_prob_reward
+                            reward = data["influence_trace_reward"].to(log_prob.device)
+                            influence_obj = self._compute_log_prob_reward_objective(
+                                log_prob=log_prob,
+                                reward=reward,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
                         anchor_param = tracer.anchor_parameter()
                         if anchor_param is not None:
                             _sync_for_timing()

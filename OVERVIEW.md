@@ -63,9 +63,16 @@ Repository root for this project is `Archer2.0/`.
 - Support output objectives:
   - `output_function=training_loss`
   - `output_function=log_prob_advantage`
+  - `output_function=log_prob_reward`
 - Support accepted/rejected aggregation scopes:
   - `accepted_rejected_scope=per_prompt`
   - `accepted_rejected_scope=all_selected`
+- Support contrastive aggregation modes:
+  - `contrastive_agg=sum`
+  - `contrastive_agg=mean`
+- Support Hessian source modes:
+  - `hessian_source=response`
+  - `hessian_source=token`
 
 ## Important Influence Config Knobs
 Configured through `trainer.influence_trace.*` (typically via env vars in run scripts):
@@ -73,6 +80,8 @@ Configured through `trainer.influence_trace.*` (typically via env vars in run sc
 - `hessian_mode`
 - `output_function`
 - `accepted_rejected_scope`
+- `contrastive_agg`
+- `hessian_source`
 - `module_name_filter`
 - `max_modules`
 - `projection_dim_factor`

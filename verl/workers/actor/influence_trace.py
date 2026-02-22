@@ -60,6 +60,8 @@ class InfluenceTraceConfig:
     force_gpu_compute: bool = True
     profile_timing: bool = False
     exclude_self_response: bool = False
+    contrastive_agg: str = "sum"       # "sum" or "mean"
+    hessian_source: str = "response"   # "response" or "token"
 
     @staticmethod
     def from_meta(meta: dict[str, Any]) -> "InfluenceTraceConfig":
@@ -84,11 +86,17 @@ class InfluenceTraceConfig:
         if hessian_mode not in {"inverse", "identity"}:
             hessian_mode = "inverse"
         output_function = str(raw.get("output_function", "training_loss")).strip().lower()
-        if output_function not in {"training_loss", "log_prob_advantage"}:
+        if output_function not in {"training_loss", "log_prob_advantage", "log_prob_reward"}:
             output_function = "training_loss"
         accepted_rejected_scope = str(raw.get("accepted_rejected_scope", "per_prompt")).strip().lower()
         if accepted_rejected_scope not in {"per_prompt", "all_selected"}:
             accepted_rejected_scope = "per_prompt"
+        contrastive_agg = str(raw.get("contrastive_agg", "sum")).strip().lower()
+        if contrastive_agg not in {"sum", "mean"}:
+            contrastive_agg = "sum"
+        hessian_source = str(raw.get("hessian_source", "response")).strip().lower()
+        if hessian_source not in {"response", "token"}:
+            hessian_source = "response"
         return InfluenceTraceConfig(
             enable=bool(raw.get("enable", False)),
             reg_lambda=float(raw.get("reg_lambda", -1.0)),
@@ -106,6 +114,8 @@ class InfluenceTraceConfig:
             force_gpu_compute=bool(raw.get("force_gpu_compute", True)),
             profile_timing=bool(raw.get("profile_timing", False)),
             exclude_self_response=bool(raw.get("exclude_self_response", False)),
+            contrastive_agg=contrastive_agg,
+            hessian_source=hessian_source,
         )
 
 
@@ -581,13 +591,13 @@ class TokenInfluenceTracer:
                 torch.empty(0, device=u_g.device, dtype=torch.float32),
             )
 
-        row_sign = torch.where(
-            row_acc,
-            torch.ones((uniq_rows.numel(),), device=u_g.device, dtype=torch.float32),
-            -torch.ones((uniq_rows.numel(),), device=u_g.device, dtype=torch.float32),
-        )
-        # Response gradient is defined as token-gradient sum (not mean).
-        token_weight = row_sign.index_select(0, inv)
+        if self.cfg.contrastive_agg == "mean":
+            n_acc = row_acc.sum().float().clamp(min=1)
+            n_rej = (~row_acc).sum().float().clamp(min=1)
+            row_weight = torch.where(row_acc, 1.0 / n_acc, -1.0 / n_rej)
+        else:
+            row_weight = torch.where(row_acc, 1.0, -1.0)
+        token_weight = row_weight.index_select(0, inv)
         weighted_u = u_g * token_weight.unsqueeze(-1)
 
         n_tokens = int(u_g.shape[0])
@@ -613,7 +623,7 @@ class TokenInfluenceTracer:
                 v_r = v_g[rmask]
                 m_r = u_r.transpose(0, 1) @ v_r  # [k_out, k_in]
                 correction = torch.sum((u_g[rmask] @ m_r) * v_g[rmask], dim=-1)
-                scores[rmask] -= row_sign[ridx] * correction
+                scores[rmask] -= row_weight[ridx] * correction
 
         pair = row_g * stride + tok_g
         return pair, scores
@@ -704,19 +714,34 @@ class TokenInfluenceTracer:
 
                 _sync()
                 t_hess = time.perf_counter()
-                solved = self._compute_kernel_solve(g_resp=g_resp, g_tok=g_tok, reg_lambda=self.cfg.reg_lambda)
+                hess_source = g_tok if self.cfg.hessian_source == "token" else g_resp
+                solved = self._compute_kernel_solve(g_resp=hess_source, g_tok=g_tok, reg_lambda=self.cfg.reg_lambda)
                 _sync()
                 self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
 
                 _sync()
                 t_tok2 = time.perf_counter()
                 infl = g_resp @ solved  # [n_resp, n_tokens]
-                score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
+                if self.cfg.contrastive_agg == "mean":
+                    score = infl[row_acc].mean(dim=0) - infl[~row_acc].mean(dim=0)
+                else:
+                    score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
 
                 if self.cfg.exclude_self_response:
                     self_infl = infl[inv, torch.arange(inv.numel(), device=inv.device)]
-                    sign_per_token = torch.where(acc_g, 1.0, -1.0)
-                    score -= sign_per_token * self_infl
+                    if self.cfg.contrastive_agg == "mean":
+                        n_acc = row_acc.sum().float()
+                        n_rej = (~row_acc).sum().float()
+                        sum_acc = infl[row_acc].sum(dim=0)
+                        sum_rej = infl[~row_acc].sum(dim=0)
+                        score = torch.where(
+                            acc_g,
+                            (sum_acc - self_infl) / (n_acc - 1).clamp(min=1) - sum_rej / n_rej.clamp(min=1),
+                            sum_acc / n_acc.clamp(min=1) - (sum_rej - self_infl) / (n_rej - 1).clamp(min=1),
+                        )
+                    else:
+                        sign_per_token = torch.where(acc_g, 1.0, -1.0)
+                        score -= sign_per_token * self_infl
 
                 pair = row_g * stride + tok_g
                 _sync()
