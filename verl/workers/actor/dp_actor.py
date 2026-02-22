@@ -154,7 +154,10 @@ class DataParallelPPOActor(BasePPOActor):
         loss_agg_mode: str,
     ) -> torch.Tensor:
         # reward: [bsz] scalar reward per response (0 or 1 in math tasks)
-        obj = agg_loss(loss_mat=log_prob * reward.unsqueeze(-1), loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        # Map to signed reward: 0→-1, 1→+1 so rejected responses also produce
+        # non-zero gradients for influence scoring.
+        signed_reward = 2.0 * reward - 1.0
+        obj = agg_loss(loss_mat=log_prob * signed_reward.unsqueeze(-1), loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
         if self.config.use_dynamic_bsz:
             obj = obj * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
         else:
