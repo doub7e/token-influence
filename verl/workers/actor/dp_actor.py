@@ -112,7 +112,8 @@ class DataParallelPPOActor(BasePPOActor):
                     f"max_tokens_per_response={cfg.max_tokens_per_response}, "
                     f"skip_optimizer_step={cfg.skip_optimizer_step}, "
                     f"grad_offload_to_cpu={cfg.grad_offload_to_cpu}, output_function={cfg.output_function}, "
-                    f"accepted_rejected_scope={cfg.accepted_rejected_scope}"
+                    f"accepted_rejected_scope={cfg.accepted_rejected_scope}, "
+                    f"exclude_self_response={cfg.exclude_self_response}"
                 )
                 for row in report:
                     print(

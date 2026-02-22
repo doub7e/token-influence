@@ -59,6 +59,7 @@ class InfluenceTraceConfig:
     grad_offload_to_cpu: bool = False
     force_gpu_compute: bool = True
     profile_timing: bool = False
+    exclude_self_response: bool = False
 
     @staticmethod
     def from_meta(meta: dict[str, Any]) -> "InfluenceTraceConfig":
@@ -104,6 +105,7 @@ class InfluenceTraceConfig:
             grad_offload_to_cpu=bool(raw.get("grad_offload_to_cpu", False)),
             force_gpu_compute=bool(raw.get("force_gpu_compute", True)),
             profile_timing=bool(raw.get("profile_timing", False)),
+            exclude_self_response=bool(raw.get("exclude_self_response", False)),
         )
 
 
@@ -604,6 +606,15 @@ class TokenInfluenceTracer:
         uv = u_g @ m  # [n_tokens, k_in]
         scores = torch.sum(uv * v_g, dim=-1)
 
+        if self.cfg.exclude_self_response:
+            for ridx in range(uniq_rows.numel()):
+                rmask = inv == ridx
+                u_r = u_g[rmask]
+                v_r = v_g[rmask]
+                m_r = u_r.transpose(0, 1) @ v_r  # [k_out, k_in]
+                correction = torch.sum((u_g[rmask] @ m_r) * v_g[rmask], dim=-1)
+                scores[rmask] -= row_sign[ridx] * correction
+
         pair = row_g * stride + tok_g
         return pair, scores
 
@@ -701,6 +712,12 @@ class TokenInfluenceTracer:
                 t_tok2 = time.perf_counter()
                 infl = g_resp @ solved  # [n_resp, n_tokens]
                 score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
+
+                if self.cfg.exclude_self_response:
+                    self_infl = infl[inv, torch.arange(inv.numel(), device=inv.device)]
+                    sign_per_token = torch.where(acc_g, 1.0, -1.0)
+                    score -= sign_per_token * self_infl
+
                 pair = row_g * stride + tok_g
                 _sync()
                 self._timing["token_scoring_s"] += time.perf_counter() - t_tok2
