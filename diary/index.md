@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-02-23 | Fix log_prob_reward: Plain log_prob (No Reward Weighting) | `5d65757` | `diary/2026-02-23-fix-logprob-reward-plain-logprob-5d65757.md` |
 | 2026-02-23 | Fix log_prob_reward: Signed Reward (2r-1) | `ce8d5ac` | `diary/2026-02-23-fix-signed-reward-ce8d5ac.md` |
 | 2026-02-22 | Influence Scoring V2: log_prob_reward + mean agg + token Hessian | `9d1f864` | `diary/2026-02-22-influence-scoring-v2-9d1f864.md` |
 | 2026-02-22 | Exclude-Self-Response Option for Influence Scoring | `09115d0` | `diary/2026-02-22-exclude-self-response-option-09115d0.md` |
