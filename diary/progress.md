@@ -4,6 +4,7 @@ Latest experiment outcomes (newest-first).
 
 | Date | Run | Config | Result | Key Metrics |
 | --- | --- | --- | --- | --- |
+| 2026-02-23 | `infl-v2-allsel-0223b` | 8xH100, `all_selected`, f128, v2 + **plain log_prob fix** | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, rej_mean=-1.67e-3, acc_mean=+4.11e-3, rej 42:58, acc 61:39, per-response sign 100% correct |
 | 2026-02-23 | `infl-v2-perprompt-0223b` | 8xH100, `per_prompt`, f128, v2 + **plain log_prob fix** | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, rej_mean=-0.054, acc_mean=+0.109, rej 37:63, acc 69:31 (mixed-sign, no double-counting) |
 | 2026-02-23 | `infl-v2-perprompt-0223` | 8xH100, `per_prompt`, f128, v2 + **signed reward fix** | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, rejected `all_zero=False`, rej_mean=-0.055, acc_mean=+0.109 |
 | 2026-02-22 | `infl-v2-perprompt-0222` | 8xH100, `per_prompt`, `inverse`, f128, `log_prob_reward`, `contrastive_agg=mean`, `hessian_source=token` | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, `hessian_solve=10.9s/13.1s`, `pop_rows=29.7s/31.6s`, `groups=1158/965` |
