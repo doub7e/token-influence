@@ -29,6 +29,7 @@ profile_timing="${INFLUENCE_PROFILE_TIMING:-False}"
 exclude_self_response="${INFLUENCE_EXCLUDE_SELF_RESPONSE:-False}"
 contrastive_agg="${INFLUENCE_CONTRASTIVE_AGG:-sum}"
 hessian_source="${INFLUENCE_HESSIAN_SOURCE:-response}"
+debug_hessian_similarity="${INFLUENCE_DEBUG_HESSIAN_SIMILARITY:-False}"
 
 mkdir -p "${ckpt_dir}" "${entropy_trace_dir}" "${influence_trace_dir}"
 
@@ -67,4 +68,5 @@ bash scripts/train/run_archer2.0_qwen2.5_1.5b_math.sh \
   +trainer.influence_trace.exclude_self_response="${exclude_self_response}" \
   +trainer.influence_trace.contrastive_agg="${contrastive_agg}" \
   +trainer.influence_trace.hessian_source="${hessian_source}" \
+  +trainer.influence_trace.debug_hessian_similarity="${debug_hessian_similarity}" \
   "$@"

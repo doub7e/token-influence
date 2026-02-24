@@ -29,23 +29,25 @@ export TORCH_NCCL_ENABLE_MONITORING=0
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 
 export INFLUENCE_EXP_NAME="${exp_name}"
-export INFLUENCE_TOTAL_STEPS=2
+export INFLUENCE_TOTAL_STEPS=1
 export INFLUENCE_PPO_EPOCHS=1
 export INFLUENCE_TOTAL_EPOCHS=1
 export INFLUENCE_HESSIAN_MODE=inverse
 export INFLUENCE_OUTPUT_FUNCTION=log_prob_reward
 export INFLUENCE_ACCEPTED_REJECTED_SCOPE="${scope}"
-export INFLUENCE_PROJECTION_DIM_FACTOR=128
+export INFLUENCE_PROJECTION_DIM_FACTOR=32
+export INFLUENCE_MAX_HESSIAN_DIM=-1
 export INFLUENCE_PROFILE_TIMING=True
 export INFLUENCE_MAX_TOKENS_PER_RESPONSE=-1
 export INFLUENCE_SKIP_OPTIMIZER_STEP=False
-export INFLUENCE_EXCLUDE_SELF_RESPONSE=False
+export INFLUENCE_EXCLUDE_SELF_RESPONSE=True
 export INFLUENCE_CONTRASTIVE_AGG=mean
 export INFLUENCE_HESSIAN_SOURCE=token
 export INFLUENCE_GRAD_OFFLOAD_TO_CPU=True
+export INFLUENCE_DEBUG_HESSIAN_SIMILARITY=True
 
 echo "[RUN] exp=${exp_name} scope=${scope}"
 echo "[CFG] output_function=log_prob_reward contrastive_agg=mean hessian_source=token"
-echo "[CFG] projection_dim_factor=128 steps=2 skip_optimizer_step=False"
+echo "[CFG] projection_dim_factor=32 max_hessian_dim=-1 steps=1 skip_optimizer_step=False"
 
 bash scripts/train/run_archer2.0_qwen2.5_1.5b_math_influence_trace.sh

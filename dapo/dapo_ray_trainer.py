@@ -468,6 +468,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "exclude_self_response": bool(influence_trace_cfg.get("exclude_self_response", False)),
                                 "contrastive_agg": str(influence_trace_cfg.get("contrastive_agg", "sum")),
                                 "hessian_source": str(influence_trace_cfg.get("hessian_source", "response")),
+                                "debug_hessian_similarity": bool(influence_trace_cfg.get("debug_hessian_similarity", False)),
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}

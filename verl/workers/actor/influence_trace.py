@@ -62,6 +62,7 @@ class InfluenceTraceConfig:
     exclude_self_response: bool = False
     contrastive_agg: str = "sum"       # "sum" or "mean"
     hessian_source: str = "response"   # "response" or "token"
+    debug_hessian_similarity: bool = False  # log cross-prompt Hessian similarity
 
     @staticmethod
     def from_meta(meta: dict[str, Any]) -> "InfluenceTraceConfig":
@@ -107,7 +108,7 @@ class InfluenceTraceConfig:
             max_modules=int(raw.get("max_modules", -1)),
             projection_dim_factor=max(int(raw.get("projection_dim_factor", 512)), 1),
             max_proj_vector_sum=int(raw.get("max_proj_vector_sum", -1)),
-            max_hessian_dim=max(int(raw.get("max_hessian_dim", 2500)), 1),
+            max_hessian_dim=int(raw.get("max_hessian_dim", 2500)),
             max_tokens_per_response=int(raw.get("max_tokens_per_response", -1)),
             skip_optimizer_step=bool(raw.get("skip_optimizer_step", False)),
             grad_offload_to_cpu=bool(raw.get("grad_offload_to_cpu", False)),
@@ -116,6 +117,7 @@ class InfluenceTraceConfig:
             exclude_self_response=bool(raw.get("exclude_self_response", False)),
             contrastive_agg=contrastive_agg,
             hessian_source=hessian_source,
+            debug_hessian_similarity=bool(raw.get("debug_hessian_similarity", False)),
         )
 
 
@@ -136,6 +138,11 @@ class TokenInfluenceTracer:
         self._compute_mode_logged = False
         self._debug: dict[str, int] = {}
         self._timing: dict[str, float] = {}
+        self._hessian_diag: dict[str, list[torch.Tensor]] = {}  # module -> list of H per group
+        self._grad_dot_accum: torch.Tensor | None = None  # [max_row+1, max_row+1] accumulated dot product
+        self._grad_hinv_dot_accum: torch.Tensor | None = None  # [max_row+1, max_row+1] H^{-1}-weighted dot
+        self._grad_row_meta: dict[int, tuple[bool, int]] = {}  # row_id -> (accepted, group_id)
+        self._debug_unproj_module: str | None = None  # one module for unprojected comparison
         self._reset_debug()
         self._reset_timing()
 
@@ -267,6 +274,15 @@ class TokenInfluenceTracer:
             name: {"u": [], "v": [], "row_id": [], "token_pos": [], "group_id": [], "accepted": []}
             for name in self.modules
         }
+        # Pick a middle-layer k_proj for unprojected vs projected comparison
+        # (layer 0 may lack data due to anchor parameter interaction)
+        if self.cfg.debug_hessian_similarity:
+            k_proj_names = [n for n in self.modules if "k_proj" in n]
+            if k_proj_names:
+                pick = k_proj_names[len(k_proj_names) // 2]
+                self._debug_unproj_module = pick
+                self.storage[pick]["raw_x"] = []
+                self.storage[pick]["raw_dy"] = []
         if self.modules:
             self._anchor_module_name = next(iter(self.modules.keys()))
 
@@ -314,6 +330,8 @@ class TokenInfluenceTracer:
             p_in = getattr(module, "_inftrace_p_in")
             v = x_sel @ p_in.t()
             setattr(module, "_inftrace_v", v)
+            if self._debug_unproj_module == module_name:
+                setattr(module, "_inftrace_x_raw", x_sel.detach())
             self._debug["forward_set_v_calls"] += 1
         return hook
 
@@ -415,6 +433,16 @@ class TokenInfluenceTracer:
             bucket["token_pos"].append(token_pos)
             bucket["group_id"].append(group_id)
             bucket["accepted"].append(accepted)
+            if self._debug_unproj_module == module_name:
+                x_raw = getattr(module, "_inftrace_x_raw", None)
+                if x_raw is not None:
+                    if self.cfg.grad_offload_to_cpu:
+                        bucket["raw_x"].append(x_raw.cpu())
+                        bucket["raw_dy"].append(dy_sel.detach().cpu())
+                    else:
+                        bucket["raw_x"].append(x_raw)
+                        bucket["raw_dy"].append(dy_sel.detach())
+                    delattr(module, "_inftrace_x_raw")
             delattr(module, "_inftrace_v")
         return hook
 
@@ -522,7 +550,8 @@ class TokenInfluenceTracer:
         g_resp: torch.Tensor,
         g_tok: torch.Tensor,
         reg_lambda: float,
-    ) -> torch.Tensor:
+        return_chol: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         dim = g_resp.shape[1]
         hessian = g_resp.T @ g_resp
         if reg_lambda > 0:
@@ -532,6 +561,8 @@ class TokenInfluenceTracer:
         hessian = hessian + reg * torch.eye(dim, device=hessian.device, dtype=hessian.dtype)
         chol = torch.linalg.cholesky(hessian)
         solved = torch.cholesky_solve(g_tok.T, chol)
+        if return_chol:
+            return solved, chol
         return solved
 
     def _is_rank0(self) -> bool:
@@ -667,6 +698,7 @@ class TokenInfluenceTracer:
         unique_groups = [None] if use_all_selected else torch.unique(group_id, sorted=True).tolist()
         pair_out: list[torch.Tensor] = []
         score_out: list[torch.Tensor] = []
+        _diag_grads: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for gid in unique_groups:
             if gid is None:
                 g_mask = torch.ones_like(group_id, dtype=torch.bool)
@@ -715,9 +747,41 @@ class TokenInfluenceTracer:
                 _sync()
                 t_hess = time.perf_counter()
                 hess_source = g_tok if self.cfg.hessian_source == "token" else g_resp
-                solved = self._compute_kernel_solve(g_resp=hess_source, g_tok=g_tok, reg_lambda=self.cfg.reg_lambda)
+                _need_chol = self.cfg.debug_hessian_similarity and self._is_rank0()
+                _solve_result = self._compute_kernel_solve(
+                    g_resp=hess_source, g_tok=g_tok,
+                    reg_lambda=self.cfg.reg_lambda, return_chol=_need_chol,
+                )
+                if _need_chol:
+                    solved, _chol = _solve_result
+                else:
+                    solved = _solve_result
                 _sync()
                 self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
+
+                # --- Hessian similarity diagnostic ---
+                if self.cfg.debug_hessian_similarity and self._is_rank0():
+                    hessian_raw = hess_source.T @ hess_source  # [D, D]
+                    h_norm = hessian_raw / hessian_raw.norm().clamp(min=1e-12)
+                    if module_name not in self._hessian_diag:
+                        self._hessian_diag[module_name] = []
+                    self._hessian_diag[module_name].append(h_norm.detach().cpu())
+                    # Collect response gradients for accumulated dot-product analysis
+                    _diag_grads.append((
+                        uniq_rows.detach().cpu(),
+                        g_resp.detach().cpu(),
+                        row_acc.detach().cpu(),
+                    ))
+                    # Compute H^{-1}-weighted response dot: g_r^T H^{-1} g_{r'}
+                    _hinv_g_resp = torch.cholesky_solve(g_resp.T.to(_chol.dtype), _chol)  # [D, N_resp]
+                    _hinv_dot = (g_resp.to(torch.float64) @ _hinv_g_resp.to(torch.float64)).detach().cpu()
+                    _diag_grads[-1] = (_diag_grads[-1][0], _diag_grads[-1][1], _diag_grads[-1][2], _hinv_dot)
+                    del _chol, _hinv_g_resp
+                    # Store row metadata (accepted, group_id) per global row
+                    _gid_int = int(gid) if gid is not None else -1
+                    for k in range(uniq_rows.numel()):
+                        rid = int(uniq_rows[k].item())
+                        self._grad_row_meta[rid] = (bool(row_acc[k].item()), _gid_int)
 
                 _sync()
                 t_tok2 = time.perf_counter()
@@ -753,6 +817,10 @@ class TokenInfluenceTracer:
             score_out.append(score)
             _sync()
             self._timing["score_aggregation_s"] += time.perf_counter() - t_agg
+
+        # Accumulate gradient dot products for this module across all groups
+        if _diag_grads and self.cfg.debug_hessian_similarity and self._is_rank0():
+            self._accumulate_grad_dot(_diag_grads)
 
         if not pair_out:
             return (
@@ -870,8 +938,434 @@ class TokenInfluenceTracer:
                     "influence": influence.detach().cpu().numpy().astype(np.float16),
                 }
             )
+        # --- Log diagnostics ---
+        if self.cfg.debug_hessian_similarity and self._is_rank0():
+            if self._hessian_diag:
+                self._log_hessian_similarity()
+                self._hessian_diag.clear()
+            if self._grad_dot_accum is not None:
+                self._log_gradient_similarity()
+                self._grad_dot_accum = None
+                self._grad_hinv_dot_accum = None
+                self._grad_row_meta.clear()
+            if self._debug_unproj_module is not None:
+                self._log_unprojected_comparison()
+
         self.clear_storage()
         return row_records
+
+    def _log_hessian_similarity(self) -> None:
+        """Compute and log pairwise cosine similarity of Hessians across prompt groups."""
+        # Pick a few representative modules to log
+        module_types = {}  # type_suffix -> first module_name
+        for name in self._hessian_diag:
+            suffix = name.rsplit(".", 1)[-1] if "." in name else name
+            if suffix not in module_types:
+                module_types[suffix] = name
+
+        print("[influence_trace][hessian_similarity] ===== Cross-Prompt Hessian Similarity =====")
+        for suffix, name in sorted(module_types.items()):
+            h_list = self._hessian_diag[name]
+            n = len(h_list)
+            if n < 2:
+                continue
+            # Stack and compute pairwise cosine similarity
+            flat = torch.stack([h.flatten() for h in h_list])  # [n, D*D]
+            # Cosine similarity matrix
+            norms = flat.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            flat_normed = flat / norms
+            sim = flat_normed @ flat_normed.T  # [n, n]
+            # Extract upper triangle (exclude diagonal)
+            mask = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+            pairwise = sim[mask]
+            # Also compute eigenvalue spectrum similarity: compare top-k eigenvalues
+            eig_list = []
+            for h in h_list:
+                eigvals = torch.linalg.eigvalsh(h)
+                eigvals = eigvals / eigvals.abs().max().clamp(min=1e-12)  # normalize
+                eig_list.append(eigvals)
+            eig_stack = torch.stack(eig_list)  # [n, D]
+            eig_norms = eig_stack.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            eig_normed = eig_stack / eig_norms
+            eig_sim = eig_normed @ eig_normed.T
+            eig_pairwise = eig_sim[mask]
+
+            D = h_list[0].shape[0]
+            print(
+                f"[influence_trace][hessian_similarity] module_type={suffix} "
+                f"(example={name}) D={D} n_groups={n} | "
+                f"H cosine: mean={pairwise.mean():.4f} std={pairwise.std():.4f} "
+                f"min={pairwise.min():.4f} max={pairwise.max():.4f} | "
+                f"eigval cosine: mean={eig_pairwise.mean():.4f} std={eig_pairwise.std():.4f} "
+                f"min={eig_pairwise.min():.4f} max={eig_pairwise.max():.4f}"
+            )
+
+    def _accumulate_grad_dot(
+        self,
+        chunks: list[tuple],
+    ) -> None:
+        """Accumulate per-module response dot products into global matrices.
+
+        For each module, concatenate g_resp across all groups and compute the
+        full pairwise dot-product matrix, then scatter-add into the global
+        ``_grad_dot_accum`` matrix indexed by global row IDs.  After all 196
+        modules are processed, ``_grad_dot_accum[i, j]`` equals
+        ``Σ_m g_i^m · g_j^m`` — the dot product of concatenated full-model
+        response gradients.
+
+        If chunks contain a 4th element (hinv_dot), also accumulates
+        H^{-1}-weighted dot products into ``_grad_hinv_dot_accum``.
+        """
+        all_rows = torch.cat([c[0] for c in chunks])  # global row IDs
+        all_g = torch.cat([c[1] for c in chunks])      # [N, D]
+        dot = all_g.to(torch.float64) @ all_g.to(torch.float64).T  # [N, N]
+
+        max_row = int(all_rows.max().item())
+        new_size = max_row + 1
+
+        def _ensure_accum(accum: torch.Tensor | None, sz: int) -> torch.Tensor:
+            if accum is None:
+                return torch.zeros(sz, sz, dtype=torch.float64)
+            if accum.shape[0] < sz:
+                old = accum
+                accum = torch.zeros(sz, sz, dtype=torch.float64)
+                accum[: old.shape[0], : old.shape[1]] = old
+            return accum
+
+        self._grad_dot_accum = _ensure_accum(self._grad_dot_accum, new_size)
+
+        ii = all_rows.unsqueeze(1).expand(-1, all_rows.numel()).reshape(-1).long()
+        jj = all_rows.unsqueeze(0).expand(all_rows.numel(), -1).reshape(-1).long()
+        self._grad_dot_accum.index_put_((ii, jj), dot.reshape(-1), accumulate=True)
+
+        # Accumulate H^{-1}-weighted dot products per group
+        has_hinv = any(len(c) >= 4 for c in chunks)
+        if has_hinv:
+            self._grad_hinv_dot_accum = _ensure_accum(self._grad_hinv_dot_accum, new_size)
+            for c in chunks:
+                if len(c) < 4:
+                    continue
+                rows_c, _, _, hinv_dot_c = c
+                ii_c = rows_c.unsqueeze(1).expand(-1, rows_c.numel()).reshape(-1).long()
+                jj_c = rows_c.unsqueeze(0).expand(rows_c.numel(), -1).reshape(-1).long()
+                self._grad_hinv_dot_accum.index_put_(
+                    (ii_c, jj_c), hinv_dot_c.to(torch.float64).reshape(-1), accumulate=True,
+                )
+
+    def _log_gradient_similarity(self) -> None:
+        """Log accumulated response gradient dot-products across ALL modules.
+
+        Reports both raw dot products ``Σ_m g_i^m · g_j^m`` and (if available)
+        H^{-1}-weighted dot products ``Σ_m g_i^{m,T} H_m^{-1} g_j^m``.
+        """
+        if self._grad_dot_accum is None or not self._grad_row_meta:
+            return
+
+        row_ids = sorted(self._grad_row_meta.keys())
+        n = len(row_ids)
+        if n < 2:
+            return
+
+        acc_flags = torch.tensor(
+            [self._grad_row_meta[r][0] for r in row_ids], dtype=torch.bool
+        )
+        group_ids = torch.tensor(
+            [self._grad_row_meta[r][1] for r in row_ids], dtype=torch.long
+        )
+        idx = torch.tensor(row_ids, dtype=torch.long)
+
+        # Report raw dot products
+        self._log_dot_matrix(
+            label="RAW_DOT",
+            dot_full=self._grad_dot_accum,
+            idx=idx, acc_flags=acc_flags, group_ids=group_ids, n=n,
+            report_norms=True,
+        )
+
+        # Report H^{-1}-weighted dot products
+        if self._grad_hinv_dot_accum is not None:
+            self._log_dot_matrix(
+                label="HINV_DOT",
+                dot_full=self._grad_hinv_dot_accum,
+                idx=idx, acc_flags=acc_flags, group_ids=group_ids, n=n,
+                report_norms=True,
+            )
+
+    def _log_dot_matrix(
+        self,
+        label: str,
+        dot_full: torch.Tensor,
+        idx: torch.Tensor,
+        acc_flags: torch.Tensor,
+        group_ids: torch.Tensor,
+        n: int,
+        report_norms: bool = True,
+    ) -> None:
+        """Generic analysis of a pairwise dot-product matrix."""
+        sub = dot_full[idx][:, idx]  # [n, n]
+
+        def _stats(vals: list[float]) -> str:
+            if not vals:
+                return "n=0"
+            t = torch.tensor(vals, dtype=torch.float64)
+            return f"n={len(vals)} mean={t.mean():.6g} std={t.std():.6g} min={t.min():.6g} max={t.max():.6g}"
+
+        print(
+            f"[influence_trace][grad_dot] ===== {label} "
+            f"(accumulated across all modules) n_resp={n} "
+            f"(acc={acc_flags.sum().item()} rej={(~acc_flags).sum().item()}) ====="
+        )
+
+        if report_norms:
+            diag = sub.diagonal()
+            norms = diag.clamp(min=0).sqrt()
+            norms_acc = [float(norms[i]) for i in range(n) if acc_flags[i]]
+            norms_rej = [float(norms[i]) for i in range(n) if not acc_flags[i]]
+            print(
+                f"[influence_trace][grad_dot][{label}] self_dot  "
+                f"acc: {_stats(norms_acc)} | rej: {_stats(norms_rej)}"
+            )
+
+        # --- Cosine similarity ---
+        diag = sub.diagonal().clamp(min=0).sqrt()
+        norm_outer = diag.unsqueeze(1) * diag.unsqueeze(0)
+        cosine = sub / norm_outer.clamp(min=1e-30)
+
+        # --- Per-prompt analysis ---
+        unique_groups = group_ids.unique().tolist()
+        pp_aa: list[float] = []
+        pp_rr: list[float] = []
+        pp_ar: list[float] = []
+        pp_cos_aa: list[float] = []
+        pp_cos_rr: list[float] = []
+        pp_cos_ar: list[float] = []
+        for g in unique_groups:
+            if g == -1:
+                continue
+            gm = group_ids == g
+            gi = torch.where(gm)[0]
+            ga = acc_flags[gm]
+            g_sub = sub[gi][:, gi]
+            g_cos = cosine[gi][:, gi]
+            a_local = torch.where(ga)[0]
+            r_local = torch.where(~ga)[0]
+            for i in range(a_local.numel()):
+                for j in range(i + 1, a_local.numel()):
+                    pp_aa.append(float(g_sub[a_local[i], a_local[j]]))
+                    pp_cos_aa.append(float(g_cos[a_local[i], a_local[j]]))
+            for i in range(r_local.numel()):
+                for j in range(i + 1, r_local.numel()):
+                    pp_rr.append(float(g_sub[r_local[i], r_local[j]]))
+                    pp_cos_rr.append(float(g_cos[r_local[i], r_local[j]]))
+            for i in a_local:
+                for j in r_local:
+                    pp_ar.append(float(g_sub[i, j]))
+                    pp_cos_ar.append(float(g_cos[i, j]))
+
+        print(
+            f"[influence_trace][grad_dot][{label}] PER_PROMPT dot  "
+            f"acc-acc: {_stats(pp_aa)} | "
+            f"rej-rej: {_stats(pp_rr)} | "
+            f"acc-rej: {_stats(pp_ar)}"
+        )
+        print(
+            f"[influence_trace][grad_dot][{label}] PER_PROMPT cos  "
+            f"acc-acc: {_stats(pp_cos_aa)} | "
+            f"rej-rej: {_stats(pp_cos_rr)} | "
+            f"acc-rej: {_stats(pp_cos_ar)}"
+        )
+
+        # --- All-prompt analysis ---
+        a_idx = torch.where(acc_flags)[0]
+        r_idx = torch.where(~acc_flags)[0]
+        max_pairs = 5000
+
+        def _collect_pairs(
+            mat: torch.Tensor, idx_a: torch.Tensor, idx_b: torch.Tensor,
+            max_n: int, same: bool,
+        ) -> list[float]:
+            na, nb = idx_a.numel(), idx_b.numel()
+            total = na * (na - 1) // 2 if same else na * nb
+            if total == 0:
+                return []
+            vals: list[float] = []
+            if total <= max_n:
+                if same:
+                    for i in range(na):
+                        for j in range(i + 1, na):
+                            vals.append(float(mat[idx_a[i], idx_a[j]]))
+                else:
+                    for i in range(na):
+                        for j in range(nb):
+                            vals.append(float(mat[idx_a[i], idx_b[j]]))
+            else:
+                for _ in range(max_n):
+                    if same:
+                        i, j = int(torch.randint(0, na, (1,))), int(torch.randint(0, na, (1,)))
+                        while i == j:
+                            j = int(torch.randint(0, na, (1,)))
+                        vals.append(float(mat[idx_a[i], idx_a[j]]))
+                    else:
+                        i = int(torch.randint(0, na, (1,)))
+                        j = int(torch.randint(0, nb, (1,)))
+                        vals.append(float(mat[idx_a[i], idx_b[j]]))
+            return vals
+
+        all_aa = _collect_pairs(sub, a_idx, a_idx, max_pairs, same=True)
+        all_rr = _collect_pairs(sub, r_idx, r_idx, max_pairs, same=True)
+        all_ar = _collect_pairs(sub, a_idx, r_idx, max_pairs, same=False)
+        all_cos_aa = _collect_pairs(cosine, a_idx, a_idx, max_pairs, same=True)
+        all_cos_rr = _collect_pairs(cosine, r_idx, r_idx, max_pairs, same=True)
+        all_cos_ar = _collect_pairs(cosine, a_idx, r_idx, max_pairs, same=False)
+
+        print(
+            f"[influence_trace][grad_dot][{label}] ALL_PROMPT dot  "
+            f"acc-acc: {_stats(all_aa)} | "
+            f"rej-rej: {_stats(all_rr)} | "
+            f"acc-rej: {_stats(all_ar)}"
+        )
+        print(
+            f"[influence_trace][grad_dot][{label}] ALL_PROMPT cos  "
+            f"acc-acc: {_stats(all_cos_aa)} | "
+            f"rej-rej: {_stats(all_cos_rr)} | "
+            f"acc-rej: {_stats(all_cos_ar)}"
+        )
+
+    def _log_unprojected_comparison(self) -> None:
+        """Compare projected vs unprojected response gradient dot-products.
+
+        For ONE debug module (k_proj), computes the pairwise response dot
+        product using both the projected (u, v) and raw (dy, x) representations.
+        Projected:   dot_proj(r, r') = Σ_{t∈r,t'∈r'} (u_t·u_{t'}) * (v_t·v_{t'})
+        Unprojected: dot_raw(r, r')  = Σ_{t∈r,t'∈r'} (dy_t·dy_{t'}) * (x_t·x_{t'})
+        """
+        name = self._debug_unproj_module
+        if name is None or name not in self.storage:
+            print(f"[influence_trace][unproj_cmp] SKIP: name={name} in_storage={name in self.storage if name else 'N/A'}")
+            return
+        bucket = self.storage[name]
+        has_raw = "raw_x" in bucket
+        n_u = len(bucket["u"]) if bucket["u"] else 0
+        n_raw = len(bucket["raw_x"]) if has_raw else 0
+        if not bucket["u"] or not has_raw or not bucket["raw_x"]:
+            return
+
+        compute_device = self._module_compute_device(name)
+        u = self._cat_and_stage(bucket["u"], device=compute_device, dtype=torch.float32)
+        v = self._cat_and_stage(bucket["v"], device=compute_device, dtype=torch.float32)
+        raw_x = self._cat_and_stage(bucket["raw_x"], device=compute_device, dtype=torch.float32)
+        raw_dy = self._cat_and_stage(bucket["raw_dy"], device=compute_device, dtype=torch.float32)
+        row_id = self._cat_and_stage(bucket["row_id"], device=compute_device, dtype=torch.int64)
+        group_id = self._cat_and_stage(bucket["group_id"], device=compute_device, dtype=torch.int64)
+        accepted = self._cat_and_stage(bucket["accepted"], device=compute_device, dtype=torch.bool)
+
+        n_tokens = u.shape[0]
+        if n_tokens == 0:
+            return
+
+        mod = self.modules[name]
+        k_in, k_out = self.module_dims[name]
+        print(
+            f"[influence_trace][unproj_cmp] ===== Unprojected vs Projected Comparison ====="
+            f"\n[influence_trace][unproj_cmp] module={name} "
+            f"in_features={mod.in_features} out_features={mod.out_features} "
+            f"k_in={k_in} k_out={k_out} D_proj={k_in * k_out} n_tokens={n_tokens}"
+        )
+
+        # Process the first mixed group
+        use_all_selected = self.cfg.accepted_rejected_scope == "all_selected"
+        unique_groups = [None] if use_all_selected else torch.unique(group_id, sorted=True).tolist()
+        for gid in unique_groups:
+            if gid is None:
+                g_mask = torch.ones_like(group_id, dtype=torch.bool)
+            else:
+                g_mask = group_id == gid
+            if int(g_mask.sum().item()) == 0:
+                continue
+            row_g = row_id[g_mask]
+            acc_g = accepted[g_mask]
+            u_g = u[g_mask]
+            v_g = v[g_mask]
+            x_g = raw_x[g_mask]
+            dy_g = raw_dy[g_mask]
+
+            uniq_rows, inv = torch.unique(row_g, sorted=True, return_inverse=True)
+            row_acc = torch.zeros(uniq_rows.numel(), device=u_g.device, dtype=torch.bool)
+            row_acc.index_put_((inv,), acc_g, accumulate=False)
+            if bool(row_acc.all().item()) or bool((~row_acc).all().item()):
+                continue  # skip all-same groups
+
+            n_resp = uniq_rows.numel()
+            proj_dot = torch.zeros(n_resp, n_resp, dtype=torch.float64, device=u_g.device)
+            raw_dot = torch.zeros(n_resp, n_resp, dtype=torch.float64, device=u_g.device)
+
+            for ri in range(n_resp):
+                mi = inv == ri
+                u_ri, v_ri = u_g[mi], v_g[mi]
+                x_ri, dy_ri = x_g[mi], dy_g[mi]
+                for rj in range(ri, n_resp):
+                    mj = inv == rj
+                    u_rj, v_rj = u_g[mj], v_g[mj]
+                    x_rj, dy_rj = x_g[mj], dy_g[mj]
+                    # Projected: Σ (u_t·u_{t'}) * (v_t·v_{t'})
+                    Mu = u_ri.to(torch.float64) @ u_rj.to(torch.float64).T
+                    Mv = v_ri.to(torch.float64) @ v_rj.to(torch.float64).T
+                    pd = (Mu * Mv).sum()
+                    proj_dot[ri, rj] = pd
+                    proj_dot[rj, ri] = pd
+                    # Unprojected: Σ (dy_t·dy_{t'}) * (x_t·x_{t'})
+                    Mdy = dy_ri.to(torch.float64) @ dy_rj.to(torch.float64).T
+                    Mx = x_ri.to(torch.float64) @ x_rj.to(torch.float64).T
+                    rd = (Mdy * Mx).sum()
+                    raw_dot[ri, rj] = rd
+                    raw_dot[rj, ri] = rd
+
+            # Extract statistics
+            diag_proj = proj_dot.diagonal()
+            diag_raw = raw_dot.diagonal()
+            mask_ut = torch.triu(torch.ones(n_resp, n_resp, dtype=torch.bool, device=u_g.device), diagonal=1)
+
+            def _pair_stats(mat: torch.Tensor, ra: torch.Tensor, label: str) -> None:
+                aa_mask = mask_ut & ra.unsqueeze(1) & ra.unsqueeze(0)
+                rr_mask = mask_ut & (~ra).unsqueeze(1) & (~ra).unsqueeze(0)
+                ar_mask = mask_ut & (ra.unsqueeze(1) ^ ra.unsqueeze(0))
+                for cat, cm in [("acc-acc", aa_mask), ("rej-rej", rr_mask), ("acc-rej", ar_mask)]:
+                    vals = mat[cm]
+                    if vals.numel() == 0:
+                        print(f"[influence_trace][unproj_cmp] {label} {cat}: n=0")
+                    else:
+                        print(
+                            f"[influence_trace][unproj_cmp] {label} {cat}: "
+                            f"n={vals.numel()} mean={vals.mean():.6g} std={vals.std():.6g} "
+                            f"min={vals.min():.6g} max={vals.max():.6g}"
+                        )
+
+            gid_str = f"group={gid}" if gid is not None else "all_selected"
+            print(
+                f"[influence_trace][unproj_cmp] {gid_str} n_resp={n_resp} "
+                f"(acc={row_acc.sum().item()} rej={(~row_acc).sum().item()})"
+            )
+            print(
+                f"[influence_trace][unproj_cmp] PROJ  self_dot: "
+                f"mean={diag_proj.mean():.6g} std={diag_proj.std():.6g}"
+            )
+            print(
+                f"[influence_trace][unproj_cmp] RAW   self_dot: "
+                f"mean={diag_raw.mean():.6g} std={diag_raw.std():.6g}"
+            )
+            _pair_stats(proj_dot, row_acc, "PROJ ")
+            _pair_stats(raw_dot, row_acc, "RAW  ")
+
+            # Also compute cosine similarity for both
+            proj_norms = diag_proj.clamp(min=0).sqrt()
+            raw_norms = diag_raw.clamp(min=0).sqrt()
+            proj_cos = proj_dot / (proj_norms.unsqueeze(1) * proj_norms.unsqueeze(0)).clamp(min=1e-30)
+            raw_cos = raw_dot / (raw_norms.unsqueeze(1) * raw_norms.unsqueeze(0)).clamp(min=1e-30)
+            _pair_stats(proj_cos, row_acc, "PROJ_COS ")
+            _pair_stats(raw_cos, row_acc, "RAW_COS  ")
+
+            # Only process first mixed group
+            break
 
     def estimate_hessian_memory_mb(self) -> dict[str, float]:
         out: dict[str, float] = {}
