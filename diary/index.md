@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-02-25 | Token Influence f64/f32 × per_prompt/all_selected Experiments | `5efb386` | `diary/2026-02-25-token-influence-f64-f32-experiments.md` |
 | 2026-02-25 | Gradient Similarity Diagnostic with H^{-1}-Weighted Dot Products | `0fe865c` | `diary/2026-02-25-grad-similarity-hinv-diagnostic-0fe865c.md` |
 | 2026-02-23 | Fix log_prob_reward: Plain log_prob (No Reward Weighting) | `5d65757` | `diary/2026-02-23-fix-logprob-reward-plain-logprob-5d65757.md` |
 | 2026-02-23 | Fix log_prob_reward: Signed Reward (2r-1) | `ce8d5ac` | `diary/2026-02-23-fix-signed-reward-ce8d5ac.md` |

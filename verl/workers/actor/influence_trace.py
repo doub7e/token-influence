@@ -699,6 +699,7 @@ class TokenInfluenceTracer:
         pair_out: list[torch.Tensor] = []
         score_out: list[torch.Tensor] = []
         _diag_grads: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        _diag_hess_accum: torch.Tensor | None = None  # [D, D] accumulated hessian (GPU, float64)
         for gid in unique_groups:
             if gid is None:
                 g_mask = torch.ones_like(group_id, dtype=torch.bool)
@@ -747,15 +748,10 @@ class TokenInfluenceTracer:
                 _sync()
                 t_hess = time.perf_counter()
                 hess_source = g_tok if self.cfg.hessian_source == "token" else g_resp
-                _need_chol = self.cfg.debug_hessian_similarity and self._is_rank0()
-                _solve_result = self._compute_kernel_solve(
+                solved = self._compute_kernel_solve(
                     g_resp=hess_source, g_tok=g_tok,
-                    reg_lambda=self.cfg.reg_lambda, return_chol=_need_chol,
+                    reg_lambda=self.cfg.reg_lambda,
                 )
-                if _need_chol:
-                    solved, _chol = _solve_result
-                else:
-                    solved = _solve_result
                 _sync()
                 self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
 
@@ -772,11 +768,14 @@ class TokenInfluenceTracer:
                         g_resp.detach().cpu(),
                         row_acc.detach().cpu(),
                     ))
-                    # Compute H^{-1}-weighted response dot: g_r^T H^{-1} g_{r'}
-                    _hinv_g_resp = torch.cholesky_solve(g_resp.T.to(_chol.dtype), _chol)  # [D, N_resp]
-                    _hinv_dot = (g_resp.to(torch.float64) @ _hinv_g_resp.to(torch.float64)).detach().cpu()
-                    _diag_grads[-1] = (_diag_grads[-1][0], _diag_grads[-1][1], _diag_grads[-1][2], _hinv_dot)
-                    del _chol, _hinv_g_resp
+                    # Accumulate hessian outer product for global H^{-1} solve
+                    _hs64 = hess_source.to(torch.float64)
+                    _hh = _hs64.T @ _hs64  # [D, D]
+                    if _diag_hess_accum is None:
+                        _diag_hess_accum = _hh
+                    else:
+                        _diag_hess_accum += _hh
+                    del _hs64, _hh
                     # Store row metadata (accepted, group_id) per global row
                     _gid_int = int(gid) if gid is not None else -1
                     for k in range(uniq_rows.numel()):
@@ -820,7 +819,8 @@ class TokenInfluenceTracer:
 
         # Accumulate gradient dot products for this module across all groups
         if _diag_grads and self.cfg.debug_hessian_similarity and self._is_rank0():
-            self._accumulate_grad_dot(_diag_grads)
+            self._accumulate_grad_dot(_diag_grads, _diag_hess_accum)
+            del _diag_hess_accum
 
         if not pair_out:
             return (
@@ -1003,6 +1003,7 @@ class TokenInfluenceTracer:
     def _accumulate_grad_dot(
         self,
         chunks: list[tuple],
+        hess_accum: torch.Tensor | None = None,
     ) -> None:
         """Accumulate per-module response dot products into global matrices.
 
@@ -1013,11 +1014,13 @@ class TokenInfluenceTracer:
         ``Σ_m g_i^m · g_j^m`` — the dot product of concatenated full-model
         response gradients.
 
-        If chunks contain a 4th element (hinv_dot), also accumulates
-        H^{-1}-weighted dot products into ``_grad_hinv_dot_accum``.
+        If ``hess_accum`` is provided (the accumulated ``Σ_t g_t g_t^T`` across
+        all groups for this module), builds a global Hessian ``H = hess_accum + λI``,
+        solves ``H^{-1} g_resp^T`` for ALL responses, and computes the full
+        pairwise H^{-1}-weighted dot product matrix (including cross-prompt pairs).
         """
         all_rows = torch.cat([c[0] for c in chunks])  # global row IDs
-        all_g = torch.cat([c[1] for c in chunks])      # [N, D]
+        all_g = torch.cat([c[1] for c in chunks])      # [N, D] on CPU
         dot = all_g.to(torch.float64) @ all_g.to(torch.float64).T  # [N, N]
 
         max_row = int(all_rows.max().item())
@@ -1038,19 +1041,24 @@ class TokenInfluenceTracer:
         jj = all_rows.unsqueeze(0).expand(all_rows.numel(), -1).reshape(-1).long()
         self._grad_dot_accum.index_put_((ii, jj), dot.reshape(-1), accumulate=True)
 
-        # Accumulate H^{-1}-weighted dot products per group
-        has_hinv = any(len(c) >= 4 for c in chunks)
-        if has_hinv:
+        # Global H^{-1}-weighted dot products using accumulated Hessian
+        if hess_accum is not None:
+            D = hess_accum.shape[0]
+            if self.cfg.reg_lambda > 0:
+                reg = self.cfg.reg_lambda
+            else:
+                reg = float((hess_accum.trace() / max(D, 1)).item()) * 0.1
+            H = hess_accum + reg * torch.eye(D, device=hess_accum.device, dtype=hess_accum.dtype)
+            chol = torch.linalg.cholesky(H)
+            all_g_dev = all_g.to(device=chol.device, dtype=chol.dtype)
+            solved_resp = torch.cholesky_solve(all_g_dev.T, chol)  # [D, N]
+            hinv_dot = (all_g_dev @ solved_resp).cpu().to(torch.float64)  # [N, N]
+            del chol, all_g_dev, solved_resp, H
+
             self._grad_hinv_dot_accum = _ensure_accum(self._grad_hinv_dot_accum, new_size)
-            for c in chunks:
-                if len(c) < 4:
-                    continue
-                rows_c, _, _, hinv_dot_c = c
-                ii_c = rows_c.unsqueeze(1).expand(-1, rows_c.numel()).reshape(-1).long()
-                jj_c = rows_c.unsqueeze(0).expand(rows_c.numel(), -1).reshape(-1).long()
-                self._grad_hinv_dot_accum.index_put_(
-                    (ii_c, jj_c), hinv_dot_c.to(torch.float64).reshape(-1), accumulate=True,
-                )
+            self._grad_hinv_dot_accum.index_put_(
+                (ii, jj), hinv_dot.reshape(-1), accumulate=True,
+            )
 
     def _log_gradient_similarity(self) -> None:
         """Log accumulated response gradient dot-products across ALL modules.

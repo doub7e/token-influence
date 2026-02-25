@@ -35,8 +35,8 @@ export INFLUENCE_TOTAL_EPOCHS=1
 export INFLUENCE_HESSIAN_MODE=inverse
 export INFLUENCE_OUTPUT_FUNCTION=log_prob_reward
 export INFLUENCE_ACCEPTED_REJECTED_SCOPE="${scope}"
-export INFLUENCE_PROJECTION_DIM_FACTOR=32
-export INFLUENCE_MAX_HESSIAN_DIM=-1
+export INFLUENCE_PROJECTION_DIM_FACTOR="${INFLUENCE_PROJECTION_DIM_FACTOR:-32}"
+export INFLUENCE_MAX_HESSIAN_DIM="${INFLUENCE_MAX_HESSIAN_DIM:--1}"
 export INFLUENCE_PROFILE_TIMING=True
 export INFLUENCE_MAX_TOKENS_PER_RESPONSE=-1
 export INFLUENCE_SKIP_OPTIMIZER_STEP=False
@@ -44,10 +44,11 @@ export INFLUENCE_EXCLUDE_SELF_RESPONSE=True
 export INFLUENCE_CONTRASTIVE_AGG=mean
 export INFLUENCE_HESSIAN_SOURCE=token
 export INFLUENCE_GRAD_OFFLOAD_TO_CPU=True
-export INFLUENCE_DEBUG_HESSIAN_SIMILARITY=True
+export INFLUENCE_DEBUG_HESSIAN_SIMILARITY="${INFLUENCE_DEBUG_HESSIAN_SIMILARITY:-False}"
 
 echo "[RUN] exp=${exp_name} scope=${scope}"
 echo "[CFG] output_function=log_prob_reward contrastive_agg=mean hessian_source=token"
-echo "[CFG] projection_dim_factor=32 max_hessian_dim=-1 steps=1 skip_optimizer_step=False"
+echo "[CFG] projection_dim_factor=${INFLUENCE_PROJECTION_DIM_FACTOR} max_hessian_dim=${INFLUENCE_MAX_HESSIAN_DIM} steps=1 skip_optimizer_step=False"
+echo "[CFG] debug_hessian_similarity=${INFLUENCE_DEBUG_HESSIAN_SIMILARITY}"
 
 bash scripts/train/run_archer2.0_qwen2.5_1.5b_math_influence_trace.sh
