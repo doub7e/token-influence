@@ -6,7 +6,7 @@ export WANDB_API_KEY="$(cat /scratch/cvlab/home/shuli/.codex/secrets/wandb_api_k
 nnodes=1
 
 project_name='Archer2.0'
-exp_name='Archer2.0-Qwen3-0.6B-Math'
+exp_name='Archer2.0-Qwen3-0.6B-Math-v1'
 
 adv_estimator=grpo
 
@@ -14,7 +14,7 @@ adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.001
+kl_loss_coef=0.01
 kl_loss_type=low_var_kl
 
 # clip
@@ -23,11 +23,11 @@ clip_ratio_high=0.2
 loss_agg_mode=token-mean
 
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 32))
+max_response_length=$((1024 * 4))  # 4096; cut from 30720 to eliminate garbage-token compute
 enable_overlong_buffer=True
-overlong_buffer_len=16
+overlong_buffer_len=256
 overlong_penalty_factor=1.0
-v_max_response_length=$((1024 * 32))
+v_max_response_length=$((1024 * 4))
 
 train_prompt_bsz=64
 gen_prompt_bsz=$((train_prompt_bsz * 1))
@@ -119,7 +119,7 @@ python -m dapo.main_dapo \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.entropy_coeff=0.01 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \

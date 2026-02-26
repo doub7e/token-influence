@@ -51,3 +51,23 @@ else:
         raise ValueError(f"vllm version {package_version} not supported and SGLang also not Found. Currently supported vllm versions are 0.6.3 and 0.7.0+")
 
 __all__ = ["LLM", "LLMEngine", "parallel_state"]
+
+
+def _patch_vllm_qwen3():
+    """Register Qwen3ForCausalLM in vLLM 0.7.x model registry."""
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+        if "Qwen3ForCausalLM" not in ModelRegistry.models:
+            # Pass the class directly (not a lazy string) so vLLM creates a
+            # _RegisteredModel instead of _LazyRegisteredModel.  The lazy
+            # variant runs inspect_model_cls() in a subprocess that cannot
+            # resolve our injected module.
+            from verl.third_party.vllm.qwen3 import Qwen3ForCausalLM
+            ModelRegistry.register_model("Qwen3ForCausalLM", Qwen3ForCausalLM)
+            print("[verl] Patched vLLM with Qwen3ForCausalLM support")
+    except Exception as e:
+        print(f"[verl] Warning: Failed to patch vLLM for Qwen3: {e}")
+
+
+if package_version is not None and vs.parse(package_version) >= vs.parse("0.7.0") and vs.parse(package_version) < vs.parse("0.8.0"):
+    _patch_vllm_qwen3()
