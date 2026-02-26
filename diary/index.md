@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-02-26 | Qwen3-0.6B-Base GRPO Math Training Scripts (4 GPU) | `4841276` | `diary/2026-02-26-qwen3-0.6b-grpo-math-training-scripts-4841276.md` |
 | 2026-02-25 | Token Influence f64/f32 × per_prompt/all_selected Experiments | `5efb386` | `diary/2026-02-25-token-influence-f64-f32-experiments.md` |
 | 2026-02-25 | Gradient Similarity Diagnostic with H^{-1}-Weighted Dot Products | `0fe865c` | `diary/2026-02-25-grad-similarity-hinv-diagnostic-0fe865c.md` |
 | 2026-02-23 | Fix log_prob_reward: Plain log_prob (No Reward Weighting) | `5d65757` | `diary/2026-02-23-fix-logprob-reward-plain-logprob-5d65757.md` |
