@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-02-27 | GRPO Hyperparameter Tuning v2: Reduce Entropy Coefficient | `bf62cc6` | `diary/2026-02-27-grpo-hyperparam-v2-entropy-reduce-bf62cc6.md` |
 | 2026-02-27 | GRPO Hyperparameter Tuning v1: Fix Entropy Collapse | `8855e24` | `diary/2026-02-27-grpo-hyperparam-v1-entropy-fix-8855e24.md` |
 | 2026-02-26 | Qwen3-0.6B-Base GRPO Math Training Scripts (4 GPU) | `4841276` | `diary/2026-02-26-qwen3-0.6b-grpo-math-training-scripts-4841276.md` |
 | 2026-02-25 | Token Influence f64/f32 × per_prompt/all_selected Experiments | `5efb386` | `diary/2026-02-25-token-influence-f64-f32-experiments.md` |
