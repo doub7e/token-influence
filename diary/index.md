@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-02-27 | GRPO Hyperparameter Tuning v4: KL Compromise | `7e51f92` | `diary/2026-02-27-grpo-hyperparam-v4-kl-compromise-7e51f92.md` |
 | 2026-02-27 | GRPO Hyperparameter Tuning v3: Dual Regularization | `fb7d945` | `diary/2026-02-27-grpo-hyperparam-v3-dual-regularization-fb7d945.md` |
 | 2026-02-27 | GRPO Hyperparameter Tuning v2: Reduce Entropy Coefficient | `bf62cc6` | `diary/2026-02-27-grpo-hyperparam-v2-entropy-reduce-bf62cc6.md` |
 | 2026-02-27 | GRPO Hyperparameter Tuning v1: Fix Entropy Collapse | `8855e24` | `diary/2026-02-27-grpo-hyperparam-v1-entropy-fix-8855e24.md` |
