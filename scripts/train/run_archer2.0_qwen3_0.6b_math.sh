@@ -6,7 +6,7 @@ export WANDB_API_KEY="$(cat /scratch/cvlab/home/shuli/.codex/secrets/wandb_api_k
 nnodes=1
 
 project_name='Archer2.0'
-exp_name='Archer2.0-Qwen3-0.6B-Math-v2'
+exp_name='Archer2.0-Qwen3-0.6B-Math-v3'
 
 adv_estimator=grpo
 
@@ -14,7 +14,7 @@ adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.01
+kl_loss_coef=0.05
 kl_loss_type=low_var_kl
 
 # clip
@@ -119,7 +119,7 @@ python -m dapo.main_dapo \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    actor_rollout_ref.actor.entropy_coeff=0.005 \
+    actor_rollout_ref.actor.entropy_coeff=0.01 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
