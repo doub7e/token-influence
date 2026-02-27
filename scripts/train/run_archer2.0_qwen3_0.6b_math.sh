@@ -6,7 +6,7 @@ export WANDB_API_KEY="$(cat /scratch/cvlab/home/shuli/.codex/secrets/wandb_api_k
 nnodes=1
 
 project_name='Archer2.0'
-exp_name='Archer2.0-Qwen3-0.6B-Math-v6'
+exp_name='Archer2.0-Qwen3-0.6B-Math-v7'
 
 adv_estimator=grpo
 
@@ -14,7 +14,7 @@ adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.001
+kl_loss_coef=0.01
 kl_loss_type=low_var_kl
 
 # clip
@@ -34,7 +34,7 @@ gen_prompt_bsz=$((train_prompt_bsz * 1))
 train_prompt_mini_bsz=16
 
 # Paths
-MODEL_PATH=./models/Qwen3-0.6B-Base
+MODEL_PATH=./models/Qwen3-0.6B
 CKPTS_DIR=./output/${project_name}/${exp_name} && mkdir -p $CKPTS_DIR
 data_dir=./data
 TRAIN_FILE=$data_dir/train/archer2.0-math-1.5b-train.json

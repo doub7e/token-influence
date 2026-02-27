@@ -17,4 +17,10 @@ python scripts/train/download_hf_model.py \
   --local-dir models/Qwen3-0.6B-Base \
   2>&1 | tee output/download_qwen3_0p6b.log
 
-echo "[OK] Qwen3-0.6B-Base setup completed."
+echo "[INFO] Downloading Qwen3-0.6B (Instruct) model checkpoint..."
+python scripts/train/download_hf_model.py \
+  --repo-id Qwen/Qwen3-0.6B \
+  --local-dir models/Qwen3-0.6B \
+  2>&1 | tee output/download_qwen3_0p6b_instruct.log
+
+echo "[OK] Qwen3-0.6B setup completed."
