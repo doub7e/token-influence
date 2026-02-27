@@ -6,7 +6,7 @@ export WANDB_API_KEY="$(cat /scratch/cvlab/home/shuli/.codex/secrets/wandb_api_k
 nnodes=1
 
 project_name='Archer2.0'
-exp_name='Archer2.0-Qwen3-0.6B-Math-v5'
+exp_name='Archer2.0-Qwen3-0.6B-Math-v6'
 
 adv_estimator=grpo
 
@@ -14,7 +14,7 @@ adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.05
+kl_loss_coef=0.001
 kl_loss_type=low_var_kl
 
 # clip
