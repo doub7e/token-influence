@@ -4,6 +4,8 @@ Latest experiment outcomes (newest-first).
 
 | Date | Run | Config | Result | Key Metrics |
 | --- | --- | --- | --- | --- |
+| 2026-03-01 | `archer-r1-15b-lp8` (baseline) | 4xH200, DeepSeek-R1-1.5B, GRPO, `archer_loss=False` | Pass | MATH-500: best **83.60%** avg@4, 91.8% pass@4 @ step 190; plateau after step 150 |
+| 2026-03-01 | `archer-r1-15b-archer` | 4xH200, DeepSeek-R1-1.5B, GRPO, `archer_loss=True` | Pass | MATH-500: best **83.85%** avg@4, 92.6% pass@4 @ step 250/300; no plateau, higher entropy |
 | 2026-02-23 | `infl-v2-allsel-0223b` | 8xH100, `all_selected`, f128, v2 + **plain log_prob fix** | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, rej_mean=-1.67e-3, acc_mean=+4.11e-3, rej 42:58, acc 61:39, per-response sign 100% correct |
 | 2026-02-23 | `infl-v2-perprompt-0223b` | 8xH100, `per_prompt`, f128, v2 + **plain log_prob fix** | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, rej_mean=-0.054, acc_mean=+0.109, rej 37:63, acc 69:31 (mixed-sign, no double-counting) |
 | 2026-02-23 | `infl-v2-perprompt-0223` | 8xH100, `per_prompt`, f128, v2 + **signed reward fix** | Pass | `rows=96/80`, `grad_norm=0.006/0.011`, rejected `all_zero=False`, rej_mean=-0.055, acc_mean=+0.109 |
