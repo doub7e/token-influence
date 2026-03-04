@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-03-04 | Qwen3-1.7B-Base GRPO: Entropy Stabilization & MATH-500 Eval | `bf8e43f` | `diary/2026-03-04-qwen3-1.7b-base-grpo-entropy-tuning.md` |
 | 2026-03-04 | Influence Token Weight: Tanh Mode + Softmax Eval + Deep Analysis | `531ffc0` | `diary/2026-03-04-influence-token-weight-tanh-mode.md` |
 | 2026-03-01 | DeepSeek-R1-1.5B GRPO Math Training & MATH-500 Eval (Baseline vs Archer) | `b29b141` | `diary/2026-03-01-r1-15b-grpo-math-training-eval.md` |
 | 2026-02-27 | GRPO Hyperparameter Tuning v5: Revert to V3 for Long Run | `35e19f7` | `diary/2026-02-27-grpo-hyperparam-v5-revert-v3-long-run-35e19f7.md` |
