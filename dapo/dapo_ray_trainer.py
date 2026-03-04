@@ -472,6 +472,20 @@ class RayDAPOTrainer(RayPPOTrainer):
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}
+                        # influence token weight config
+                        influence_token_weight_cfg = self.config.trainer.get("influence_token_weight", {})
+                        batch.meta_info["influence_token_weight_cfg"] = {
+                            "enabled": bool(influence_token_weight_cfg.get("enabled", False)),
+                            "threshold": float(influence_token_weight_cfg.get("threshold", 1.0)),
+                            "mode": str(influence_token_weight_cfg.get("mode", "zero")),
+                            "normalize": str(influence_token_weight_cfg.get("normalize", "zscore")),
+                            "apply_epochs": list(influence_token_weight_cfg.get("apply_epochs", [1, 2])),
+                            "softmax_temperature": float(influence_token_weight_cfg.get("softmax_temperature", 1.0)),
+                            "weight_clamp_min": float(influence_token_weight_cfg.get("weight_clamp_min", 0.1)),
+                            "weight_clamp_max": float(influence_token_weight_cfg.get("weight_clamp_max", 5.0)),
+                            "tanh_alpha": float(influence_token_weight_cfg.get("tanh_alpha", 0.5)),
+                            "tanh_tau": float(influence_token_weight_cfg.get("tanh_tau", 1.0)),
+                        }
                         # update actor
                         with _timer("update_actor", timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch)

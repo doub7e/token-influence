@@ -23,6 +23,7 @@ import os
 import time
 from typing import Any, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -39,6 +40,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.influence_trace import InfluenceTraceConfig, TokenInfluenceTracer
+from verl.workers.actor.influence_token_weight import InfluenceTokenWeightConfig, build_token_loss_weights
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -449,6 +451,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
         self._influence_rows = []
         influence_enabled = self._setup_influence_trace(data.meta_info)
+        influence_token_weight_cfg = InfluenceTokenWeightConfig.from_dict(
+            data.meta_info.get("influence_token_weight_cfg", {})
+        )
+        _cached_influence: dict[int, "np.ndarray"] = {}  # row_id -> influence array
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
@@ -642,6 +648,28 @@ class DataParallelPPOActor(BasePPOActor):
                         high_entropy_mask = (masked_entropy <= q80) & response_mask # only low entropy token is True
                         low_entropy_mask = (masked_entropy > q80) & response_mask #  only high entropy token is True
 
+                    # --- Build influence-based token weights (epochs 1+) ---
+                    token_weights = None
+                    if (
+                        influence_token_weight_cfg.enabled
+                        and _cached_influence
+                        and epoch in influence_token_weight_cfg.apply_epochs
+                        and "influence_trace_row_id" in data
+                    ):
+                        _accepted = data.get("influence_trace_accepted")
+                        if _accepted is not None:
+                            _accepted = _accepted.bool()
+                        token_weights = build_token_loss_weights(
+                            influence_cache=_cached_influence,
+                            row_ids=data["influence_trace_row_id"].to(torch.long),
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            config=influence_token_weight_cfg,
+                            accepted=_accepted,
+                        )
+                        masked_frac = float((token_weights != 1.0).float().sum() / max(response_mask.sum(), 1))
+                        append_to_dict(metrics, {"actor/token_weight_masked_frac": masked_frac})
+
                     if self.config.get("use_archer_policy_loss", False):
                         pg_loss, pg_clipfrac_upper, pg_clipfrac_lower, negative_pg_clipfrac_dual, positive_pg_clipfrac_dual = compute_policy_loss_archer(
                             old_log_prob=old_log_prob,
@@ -656,6 +684,7 @@ class DataParallelPPOActor(BasePPOActor):
                             negative_clip_ratio_c=3.0,
                             positive_clip_ratio_c=3.0,
                             use_dynamic_clip=self.config.get("use_dynamic_clip", False),
+                            token_weights=token_weights,
                         )
                     else:
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
@@ -674,6 +703,7 @@ class DataParallelPPOActor(BasePPOActor):
                             high_entropy_clip_ratio_high=self.config.get("high_entropy_clip_ratio_high", clip_ratio_high),
                             clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
+                            token_weights=token_weights,
                         )
 
                     if entropy_coeff != 0:
@@ -754,17 +784,38 @@ class DataParallelPPOActor(BasePPOActor):
                     grad_norm_value = float(grad_norm)
                 data = {"actor/grad_norm": grad_norm_value}
                 append_to_dict(metrics, data)
+            # --- Eager pop: cache influence rows after epoch 0 for token weighting ---
+            if (
+                influence_token_weight_cfg.enabled
+                and influence_enabled
+                and epoch == 0
+                and self._influence_tracer is not None
+            ):
+                _sync_for_timing()
+                t_pop_rows = time.perf_counter()
+                eager_rows = self._influence_tracer.pop_token_influence_rows()
+                _sync_for_timing()
+                influence_timing["pop_rows"] += time.perf_counter() - t_pop_rows
+                for row in eager_rows:
+                    _cached_influence[row["row_id"]] = row["influence"]
+                self._influence_rows = eager_rows
+                if _rank0():
+                    print(f"[influence_token_weight] eager pop after epoch 0: {len(eager_rows)} rows cached")
         if influence_enabled and self._influence_tracer is not None:
-            if profile_influence_timing and _rank0():
-                print("[influence_trace][phase] before_pop_rows")
-            _sync_for_timing()
-            t_pop_rows = time.perf_counter()
-            self._influence_rows = self._influence_tracer.pop_token_influence_rows()
-            _sync_for_timing()
-            influence_timing["pop_rows"] += time.perf_counter() - t_pop_rows
-            if profile_influence_timing and _rank0():
-                print(f"[influence_trace][phase] after_pop_rows rows={len(self._influence_rows)}")
-            rows_emitted = float(len(self._influence_rows))
+            if _cached_influence:
+                # Already eagerly popped after epoch 0 for token weighting
+                rows_emitted = float(len(self._influence_rows))
+            else:
+                if profile_influence_timing and _rank0():
+                    print("[influence_trace][phase] before_pop_rows")
+                _sync_for_timing()
+                t_pop_rows = time.perf_counter()
+                self._influence_rows = self._influence_tracer.pop_token_influence_rows()
+                _sync_for_timing()
+                influence_timing["pop_rows"] += time.perf_counter() - t_pop_rows
+                if profile_influence_timing and _rank0():
+                    print(f"[influence_trace][phase] after_pop_rows rows={len(self._influence_rows)}")
+                rows_emitted = float(len(self._influence_rows))
             append_to_dict(metrics, {"influence_trace/rows_emitted": rows_emitted})
             dbg = self._influence_tracer.debug_stats(reset=True)
             append_to_dict(

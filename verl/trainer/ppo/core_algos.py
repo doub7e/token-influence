@@ -548,6 +548,7 @@ def compute_policy_loss_archer(
     positive_clip_ratio_c=3.0,
     use_dynamic_clip=False,
     loss_agg_mode: str = "token-mean",
+    token_weights=None,
 ):
     assert negative_clip_ratio_c > 1.0, "The negative_clip_ratio_c should be greater than 1.0," + f" but get the value: {negative_clip_ratio_c}."
     assert positive_clip_ratio_c > 1.0, "The positive_clip_ratio_c should be greater than 1.0," + f" but get the value: {positive_clip_ratio_c}."
@@ -581,6 +582,8 @@ def compute_policy_loss_archer(
     positive_pg_losses = torch.where(positive_clipped_mask, positive_pg_losses_dual, positive_pg_losses_clip)
 
     pg_losses = torch.where(advantages < 0, negative_pg_losses, positive_pg_losses)
+    if token_weights is not None:
+        pg_losses = pg_losses * token_weights
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac_upper, pg_clipfrac_lower, negative_pg_clipfrac_dual, positive_pg_clipfrac_dual
@@ -602,6 +605,7 @@ def compute_policy_loss(
     high_entropy_clip_ratio_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    token_weights=None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -662,6 +666,8 @@ def compute_policy_loss(
     pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    if token_weights is not None:
+        pg_losses = pg_losses * token_weights
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
