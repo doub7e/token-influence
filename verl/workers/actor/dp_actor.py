@@ -23,6 +23,7 @@ import os
 import time
 from typing import Any, Tuple
 
+import gc
 import numpy as np
 import torch
 from torch import nn
@@ -147,17 +148,18 @@ class DataParallelPPOActor(BasePPOActor):
             obj = obj / self.gradient_accumulation
         return obj
 
-    def _compute_log_prob_reward_objective(
+    def _compute_log_prob_objective(
         self,
         *,
         log_prob: torch.Tensor,
-        reward: torch.Tensor,
         response_mask: torch.Tensor,
         loss_agg_mode: str,
     ) -> torch.Tensor:
-        # Plain log-prob objective (no reward weighting).
-        # All responses produce identical-type gradients (∇log_prob);
-        # the accepted/rejected sign is handled entirely by contrastive scoring.
+        """Plain log-prob objective: ∇log p(token | context).
+
+        All responses produce identical-type gradients; the accepted/rejected
+        sign is handled entirely by the contrastive scoring direction.
+        """
         obj = agg_loss(loss_mat=log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
         if self.config.use_dynamic_bsz:
             obj = obj * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
@@ -208,6 +210,7 @@ class DataParallelPPOActor(BasePPOActor):
                         row_ids=influence_payload["row_ids"],
                         group_ids=influence_payload["group_ids"],
                         accepted=influence_payload["accepted"],
+                        advantage=influence_payload.get("advantage"),
                     )
 
                 # unpad the position_ids to align the rotary
@@ -466,6 +469,7 @@ class DataParallelPPOActor(BasePPOActor):
             "influence_trace_row_id",
             "influence_trace_accepted",
             "influence_trace_reward",
+            "influence_trace_advantage",
         ]
         if influence_enabled:
             for key in influence_keys:
@@ -508,6 +512,137 @@ class DataParallelPPOActor(BasePPOActor):
 
         def _rank0() -> bool:
             return (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+
+        # =====================================================================
+        # Influence pre-pass: compute influence scores BEFORE training epochs
+        # so that token weights can be applied in ALL epochs.
+        # This replaces the old design where influence was captured during
+        # epoch 0, wasting one epoch without token weighting.
+        # =====================================================================
+        run_influence_prepass = (
+            influence_enabled
+            and influence_token_weight_cfg.enabled
+            and self._influence_cfg is not None
+            and self._influence_cfg.output_function in ("log_prob_advantage", "log_prob")
+            and self._influence_tracer is not None
+        )
+        if run_influence_prepass:
+            # Ensure gradient_accumulation is set (used by objective functions)
+            if not hasattr(self, 'gradient_accumulation') or self.gradient_accumulation is None:
+                self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+            if _rank0():
+                print("[influence_prepass] Starting influence pre-pass before training epochs")
+            # NOTE: keep train() mode so that GradientCheckpointingLayer remains
+            # active (it gates on self.training).  Switching to eval() disables
+            # gradient checkpointing and causes OOM on long sequences.
+            # Qwen3 has no dropout, so train vs eval makes no functional difference.
+            # Iterate the same mini-batch / micro-batch structure
+            for batch_idx, prepass_data in enumerate(dataloader):
+                prepass_mini = prepass_data
+                if has_multi_modal_inputs:
+                    num_micro = prepass_mini.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                    prepass_micros = prepass_data.select(select_keys, non_tensor_select_keys).chunk(num_micro)
+                elif self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    prepass_micros, _ = rearrange_micro_batches(batch=prepass_mini, max_token_len=max_token_len)
+                else:
+                    prepass_micros = prepass_mini.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                for micro_idx, micro_data in enumerate(prepass_micros):
+                    if isinstance(micro_data, DataProto):
+                        micro_data = {**micro_data.batch.to(get_device_id()), **micro_data.non_tensor_batch}
+                    else:
+                        micro_data = micro_data.to(get_device_id())
+                    responses = micro_data["responses"]
+                    response_length = responses.size(1)
+                    attention_mask = micro_data["attention_mask"]
+                    if multi_turn:
+                        response_mask = attention_mask[:, -response_length:]
+                        if "loss_mask" in micro_data:
+                            response_mask = micro_data["loss_mask"][:, -response_length:]
+                    else:
+                        response_mask = attention_mask[:, -response_length:]
+
+                    # Build influence payload
+                    influence_payload = None
+                    if "influence_trace_selected" in micro_data:
+                        selected_rows = micro_data["influence_trace_selected"].bool()
+                        if bool(selected_rows.any().item()):
+                            saw_influence_payload = True
+                        influence_payload = {
+                            "selected_rows": selected_rows,
+                            "response_mask": response_mask.bool(),
+                            "row_ids": micro_data["influence_trace_row_id"].to(torch.long),
+                            "group_ids": micro_data["influence_trace_group_id"].to(torch.long),
+                            "accepted": micro_data["influence_trace_accepted"].bool(),
+                            "advantage": micro_data.get("influence_trace_advantage", None),
+                        }
+                    if influence_payload is None:
+                        continue
+
+                    # Forward with influence hooks
+                    _sync_for_timing()
+                    t_fwd = time.perf_counter()
+                    _, log_prob = self._forward_micro_batch(
+                        micro_batch=micro_data,
+                        temperature=temperature,
+                        calculate_entropy=False,
+                        influence_payload=influence_payload,
+                    )
+                    _sync_for_timing()
+                    influence_timing["forward_1"] += time.perf_counter() - t_fwd
+
+                    # Backward for influence (log_prob or log_prob_advantage)
+                    tracer = self._influence_tracer
+                    influence_cfg = self._influence_cfg
+                    loss_agg_mode = self.config.loss_agg_mode
+                    if influence_cfg.output_function == "log_prob_advantage":
+                        influence_obj = self._compute_log_prob_advantage_objective(
+                            log_prob=log_prob,
+                            advantages=micro_data["advantages"],
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                    else:  # log_prob
+                        influence_obj = self._compute_log_prob_objective(
+                            log_prob=log_prob,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                    anchor_param = tracer.anchor_parameter()
+                    if anchor_param is not None:
+                        _sync_for_timing()
+                        t_bw = time.perf_counter()
+                        torch.autograd.backward(
+                            influence_obj,
+                            inputs=[anchor_param],
+                            retain_graph=False,
+                        )
+                        if anchor_param.grad is not None:
+                            anchor_param.grad = None
+                        _sync_for_timing()
+                        influence_timing["logprob_backward"] += time.perf_counter() - t_bw
+                    tracer.end_microbatch()
+
+            # Pop influence rows and build cache
+            _sync_for_timing()
+            t_pop = time.perf_counter()
+            eager_rows = self._influence_tracer.pop_token_influence_rows()
+            _sync_for_timing()
+            influence_timing["pop_rows"] += time.perf_counter() - t_pop
+            for row in eager_rows:
+                _cached_influence[row["row_id"]] = row["influence"]
+            self._influence_rows = eager_rows
+            if _rank0():
+                print(f"[influence_prepass] Done: {len(eager_rows)} rows cached")
+
+            # No need to toggle train/eval — prepass stays in train() mode
+
+            # Free GPU memory held by prepass computation graphs so that
+            # the subsequent vLLM wake_up (cumem_allocator) can reclaim it.
+            # gc.collect() breaks reference cycles that may pin GPU tensors.
+            gc.collect()
+            torch.cuda.empty_cache()
 
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -556,7 +691,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # if entropy_coeff != 0:
                     #     calculate_entropy = True
                     influence_payload = None
-                    if influence_enabled and epoch == 0 and "influence_trace_selected" in data:
+                    if influence_enabled and not run_influence_prepass and epoch == 0 and "influence_trace_selected" in data:
                         selected_rows = data["influence_trace_selected"].bool()
                         if bool(selected_rows.any().item()):
                             saw_influence_payload = True
@@ -566,6 +701,7 @@ class DataParallelPPOActor(BasePPOActor):
                             "row_ids": data["influence_trace_row_id"].to(torch.long),
                             "group_ids": data["influence_trace_group_id"].to(torch.long),
                             "accepted": data["influence_trace_accepted"].bool(),
+                            "advantage": data.get("influence_trace_advantage", None),
                         }
                     influence_cfg = self._influence_cfg
                     capture_with_training_backward = (
@@ -574,7 +710,7 @@ class DataParallelPPOActor(BasePPOActor):
                     capture_with_separate_backward = (
                         influence_payload is not None
                         and influence_cfg is not None
-                        and influence_cfg.output_function in ("log_prob_advantage", "log_prob_reward")
+                        and influence_cfg.output_function in ("log_prob_advantage", "log_prob")
                     )
                     capture_with_influence_backward = capture_with_training_backward or capture_with_separate_backward
                     if profile_influence_timing and _rank0():
@@ -606,11 +742,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask=response_mask,
                                 loss_agg_mode=loss_agg_mode,
                             )
-                        else:  # log_prob_reward
-                            reward = data["influence_trace_reward"].to(log_prob.device)
-                            influence_obj = self._compute_log_prob_reward_objective(
+                        else:  # log_prob
+                            influence_obj = self._compute_log_prob_objective(
                                 log_prob=log_prob,
-                                reward=reward,
                                 response_mask=response_mask,
                                 loss_agg_mode=loss_agg_mode,
                             )
@@ -648,20 +782,24 @@ class DataParallelPPOActor(BasePPOActor):
                         high_entropy_mask = (masked_entropy <= q80) & response_mask # only low entropy token is True
                         low_entropy_mask = (masked_entropy > q80) & response_mask #  only high entropy token is True
 
-                    # --- Build influence-based token weights (epochs 1+) ---
+                    # --- Build influence-based token weights ---
+                    # When prepass ran, weights are available for ALL epochs.
+                    # When legacy (epoch-0 capture), respect apply_epochs.
                     token_weights = None
-                    if (
+                    _apply_weight = (
                         influence_token_weight_cfg.enabled
                         and _cached_influence
-                        and epoch in influence_token_weight_cfg.apply_epochs
                         and "influence_trace_row_id" in data
-                    ):
-                        _accepted = data.get("influence_trace_accepted")
-                        if _accepted is not None:
-                            _accepted = _accepted.bool()
-                        token_weights = build_token_loss_weights(
+                        and (run_influence_prepass or epoch in influence_token_weight_cfg.apply_epochs)
+                    )
+                    if _apply_weight:
+                        _accepted = None
+                        if "influence_trace_accepted" in data:
+                            _accepted = data["influence_trace_accepted"].bool()
+                        _row_ids = data["influence_trace_row_id"].to(torch.long)
+                        token_weights, tw_stats = build_token_loss_weights(
                             influence_cache=_cached_influence,
-                            row_ids=data["influence_trace_row_id"].to(torch.long),
+                            row_ids=_row_ids,
                             advantages=advantages,
                             response_mask=response_mask,
                             config=influence_token_weight_cfg,
@@ -669,6 +807,31 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         masked_frac = float((token_weights != 1.0).float().sum() / max(response_mask.sum(), 1))
                         append_to_dict(metrics, {"actor/token_weight_masked_frac": masked_frac})
+                        # Log sign guard stats
+                        for k, v in tw_stats.items():
+                            append_to_dict(metrics, {f"actor/token_weight_{k}": v})
+                        # Log weight statistics
+                        tw_valid = token_weights[response_mask.bool()]
+                        if tw_valid.numel() > 1:
+                            append_to_dict(metrics, {
+                                "actor/token_weight_mean": float(tw_valid.mean()),
+                                "actor/token_weight_std": float(tw_valid.std()),
+                                "actor/token_weight_min": float(tw_valid.min()),
+                                "actor/token_weight_max": float(tw_valid.max()),
+                                "actor/token_weight_neg_frac": float((tw_valid < 0).float().mean()),
+                            })
+
+                    # Apply influence weights: direct mode targets advantages, others target loss
+                    token_weights_for_loss = None
+                    if token_weights is not None:
+                        if (
+                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio")
+                            and influence_token_weight_cfg.adv_target == "advantage"
+                        ):
+                            advantages = advantages * token_weights
+                            # token_weights_for_loss stays None — don't also multiply loss
+                        else:
+                            token_weights_for_loss = token_weights
 
                     if self.config.get("use_archer_policy_loss", False):
                         pg_loss, pg_clipfrac_upper, pg_clipfrac_lower, negative_pg_clipfrac_dual, positive_pg_clipfrac_dual = compute_policy_loss_archer(
@@ -684,7 +847,7 @@ class DataParallelPPOActor(BasePPOActor):
                             negative_clip_ratio_c=3.0,
                             positive_clip_ratio_c=3.0,
                             use_dynamic_clip=self.config.get("use_dynamic_clip", False),
-                            token_weights=token_weights,
+                            token_weights=token_weights_for_loss,
                         )
                     else:
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
@@ -703,7 +866,7 @@ class DataParallelPPOActor(BasePPOActor):
                             high_entropy_clip_ratio_high=self.config.get("high_entropy_clip_ratio_high", clip_ratio_high),
                             clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
-                            token_weights=token_weights,
+                            token_weights=token_weights_for_loss,
                         )
 
                     if entropy_coeff != 0:
@@ -784,10 +947,12 @@ class DataParallelPPOActor(BasePPOActor):
                     grad_norm_value = float(grad_norm)
                 data = {"actor/grad_norm": grad_norm_value}
                 append_to_dict(metrics, data)
-            # --- Eager pop: cache influence rows after epoch 0 for token weighting ---
+            # --- Legacy eager pop: cache influence rows after epoch 0 for token weighting ---
+            # (Only needed when NOT using prepass, e.g. output_function=training_loss)
             if (
                 influence_token_weight_cfg.enabled
                 and influence_enabled
+                and not run_influence_prepass
                 and epoch == 0
                 and self._influence_tracer is not None
             ):
@@ -862,4 +1027,9 @@ class DataParallelPPOActor(BasePPOActor):
                 },
             )
         self.actor_optimizer.zero_grad()
+        # Aggressively free GPU memory before the FSDP→vLLM transition.
+        # Without this, fragmented allocations from training + influence prepass
+        # can prevent vLLM's cumem_allocator from mapping KV cache memory.
+        gc.collect()
+        torch.cuda.empty_cache()
         return metrics

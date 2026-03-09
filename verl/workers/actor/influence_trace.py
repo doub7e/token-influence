@@ -60,9 +60,11 @@ class InfluenceTraceConfig:
     force_gpu_compute: bool = True
     profile_timing: bool = False
     exclude_self_response: bool = False
+    self_influence_scale: float = 0.0  # when exclude_self_response=True, add back this fraction of self-influence (0=full exclude, 1=full include)
     contrastive_agg: str = "sum"       # "sum" or "mean"
     hessian_source: str = "response"   # "response" or "token"
     debug_hessian_similarity: bool = False  # log cross-prompt Hessian similarity
+    score_normalization: str = "none"  # "none" | "h_inv_norm" — per-token normalization to remove gradient magnitude
 
     @staticmethod
     def from_meta(meta: dict[str, Any]) -> "InfluenceTraceConfig":
@@ -87,17 +89,22 @@ class InfluenceTraceConfig:
         if hessian_mode not in {"inverse", "identity"}:
             hessian_mode = "inverse"
         output_function = str(raw.get("output_function", "training_loss")).strip().lower()
-        if output_function not in {"training_loss", "log_prob_advantage", "log_prob_reward"}:
+        if output_function == "log_prob_reward":
+            output_function = "log_prob"  # backward-compatible alias
+        if output_function not in {"training_loss", "log_prob_advantage", "log_prob"}:
             output_function = "training_loss"
         accepted_rejected_scope = str(raw.get("accepted_rejected_scope", "per_prompt")).strip().lower()
-        if accepted_rejected_scope not in {"per_prompt", "all_selected"}:
+        if accepted_rejected_scope not in {"per_prompt", "all_selected", "global_selected"}:
             accepted_rejected_scope = "per_prompt"
         contrastive_agg = str(raw.get("contrastive_agg", "sum")).strip().lower()
-        if contrastive_agg not in {"sum", "mean"}:
+        if contrastive_agg not in {"sum", "mean", "advantage"}:
             contrastive_agg = "sum"
         hessian_source = str(raw.get("hessian_source", "response")).strip().lower()
         if hessian_source not in {"response", "token"}:
             hessian_source = "response"
+        score_normalization = str(raw.get("score_normalization", "none")).strip().lower()
+        if score_normalization not in {"none", "h_inv_norm"}:
+            score_normalization = "none"
         return InfluenceTraceConfig(
             enable=bool(raw.get("enable", False)),
             reg_lambda=float(raw.get("reg_lambda", -1.0)),
@@ -115,9 +122,11 @@ class InfluenceTraceConfig:
             force_gpu_compute=bool(raw.get("force_gpu_compute", True)),
             profile_timing=bool(raw.get("profile_timing", False)),
             exclude_self_response=bool(raw.get("exclude_self_response", False)),
+            self_influence_scale=float(raw.get("self_influence_scale", 0.0)),
             contrastive_agg=contrastive_agg,
             hessian_source=hessian_source,
             debug_hessian_similarity=bool(raw.get("debug_hessian_similarity", False)),
+            score_normalization=score_normalization,
         )
 
 
@@ -132,6 +141,11 @@ class TokenInfluenceTracer:
         self.module_infos: list[dict[str, Any]] = []
         self.current_capture: dict[str, torch.Tensor] | None = None
         self.storage: dict[str, dict[str, list[torch.Tensor]]] = {}
+        # Shared metadata storage: stored once per microbatch, referenced by all modules
+        self._shared_meta: dict[str, list[torch.Tensor]] = {
+            "row_id": [], "token_pos": [], "group_id": [], "accepted": [], "advantage": [],
+        }
+        self._shared_meta_count: int = 0  # number of shared metadata chunks
         self._anchor_module_name: str | None = None
         self._anchor_activation: torch.Tensor | None = None
         self._store_enabled: bool = True
@@ -271,9 +285,13 @@ class TokenInfluenceTracer:
             self.handles.append(mod.register_forward_hook(self._make_forward_hook(name)))
             self.handles.append(mod.register_full_backward_hook(self._make_backward_hook(name)))
         self.storage = {
-            name: {"u": [], "v": [], "row_id": [], "token_pos": [], "group_id": [], "accepted": []}
+            name: {"u": [], "v": []}
             for name in self.modules
         }
+        self._shared_meta = {
+            "row_id": [], "token_pos": [], "group_id": [], "accepted": [], "advantage": [],
+        }
+        self._shared_meta_count = 0
         # Pick a middle-layer k_proj for unprojected vs projected comparison
         # (layer 0 may lack data due to anchor parameter interaction)
         if self.cfg.debug_hessian_similarity:
@@ -335,53 +353,6 @@ class TokenInfluenceTracer:
             self._debug["forward_set_v_calls"] += 1
         return hook
 
-    def _consume_output_grad(
-        self,
-        *,
-        module_name: str,
-        module: nn.Module,
-        dy: torch.Tensor,
-        v: torch.Tensor,
-        capture: dict[str, torch.Tensor] | None,
-    ) -> None:
-        if capture is None or not self._store_enabled:
-            return
-        self._debug["output_grad_hook_calls"] += 1
-        if dy.dim() == 3:
-            if dy.shape[0] != 1:
-                raise ValueError("Influence trace currently expects rmpad grad output with batch axis = 1.")
-            dy_tokens = dy.squeeze(0)
-        elif dy.dim() == 2:
-            dy_tokens = dy
-        else:
-            raise ValueError(f"Unsupported linear grad dim for influence trace: {dy.dim()}")
-        capture_idx = capture["capture_idx"]
-        dy_sel = dy_tokens.index_select(0, capture_idx).to(torch.float32)
-        p_out = getattr(module, "_inftrace_p_out")
-        u = dy_sel @ p_out.t()
-        if self.cfg.grad_offload_to_cpu:
-            u = u.detach().cpu()
-            v = v.detach().cpu()
-            row_id = capture["row_id"].detach().cpu()
-            token_pos = capture["token_pos"].detach().cpu()
-            group_id = capture["group_id"].detach().cpu()
-            accepted = capture["accepted"].detach().cpu()
-        else:
-            u = u.detach()
-            v = v.detach()
-            row_id = capture["row_id"]
-            token_pos = capture["token_pos"]
-            group_id = capture["group_id"]
-            accepted = capture["accepted"]
-        bucket = self.storage[module_name]
-        bucket["u"].append(u)
-        bucket["v"].append(v)
-        bucket["row_id"].append(row_id)
-        bucket["token_pos"].append(token_pos)
-        bucket["group_id"].append(group_id)
-        bucket["accepted"].append(accepted)
-        self._debug["stored_chunks"] += 1
-
     def _make_backward_hook(self, module_name: str):
         def hook(module: nn.Module, grad_input, grad_output):
             self._debug["backward_hook_calls"] += 1
@@ -412,36 +383,30 @@ class TokenInfluenceTracer:
             p_out = getattr(module, "_inftrace_p_out")
             u = dy_sel @ p_out.t()
             v = module._inftrace_v
-            if self.cfg.grad_offload_to_cpu:
-                u = u.detach().cpu()
-                v = v.detach().cpu()
-                row_id = self.current_capture["row_id"].detach().cpu()
-                token_pos = self.current_capture["token_pos"].detach().cpu()
-                group_id = self.current_capture["group_id"].detach().cpu()
-                accepted = self.current_capture["accepted"].detach().cpu()
-            else:
-                u = u.detach()
-                v = v.detach()
-                row_id = self.current_capture["row_id"]
-                token_pos = self.current_capture["token_pos"]
-                group_id = self.current_capture["group_id"]
-                accepted = self.current_capture["accepted"]
+            # Store u, v in bf16 (convert to fp32 only during scoring)
             bucket = self.storage[module_name]
-            bucket["u"].append(u)
-            bucket["v"].append(v)
-            bucket["row_id"].append(row_id)
-            bucket["token_pos"].append(token_pos)
-            bucket["group_id"].append(group_id)
-            bucket["accepted"].append(accepted)
+            if self.cfg.grad_offload_to_cpu:
+                bucket["u"].append(u.detach().to(torch.bfloat16).cpu())
+                bucket["v"].append(v.detach().to(torch.bfloat16).cpu())
+            else:
+                bucket["u"].append(u.detach().to(torch.bfloat16))
+                bucket["v"].append(v.detach().to(torch.bfloat16))
+            self._debug["stored_chunks"] += 1
+            # Store shared metadata only once per microbatch (first module stores it)
+            if self._shared_meta_count == len(bucket["u"]) - 1:
+                # This is the first module to store for this microbatch chunk
+                _to_cpu = self.cfg.grad_offload_to_cpu
+                self._shared_meta["row_id"].append(self.current_capture["row_id"].detach().cpu() if _to_cpu else self.current_capture["row_id"].detach())
+                self._shared_meta["token_pos"].append(self.current_capture["token_pos"].detach().cpu() if _to_cpu else self.current_capture["token_pos"].detach())
+                self._shared_meta["group_id"].append(self.current_capture["group_id"].detach().cpu() if _to_cpu else self.current_capture["group_id"].detach())
+                self._shared_meta["accepted"].append(self.current_capture["accepted"].detach().cpu() if _to_cpu else self.current_capture["accepted"].detach())
+                self._shared_meta["advantage"].append(self.current_capture["advantage"].detach().cpu() if _to_cpu else self.current_capture["advantage"].detach())
+                self._shared_meta_count += 1
             if self._debug_unproj_module == module_name:
                 x_raw = getattr(module, "_inftrace_x_raw", None)
                 if x_raw is not None:
-                    if self.cfg.grad_offload_to_cpu:
-                        bucket["raw_x"].append(x_raw.cpu())
-                        bucket["raw_dy"].append(dy_sel.detach().cpu())
-                    else:
-                        bucket["raw_x"].append(x_raw)
-                        bucket["raw_dy"].append(dy_sel.detach())
+                    bucket.setdefault("raw_x", []).append(x_raw)
+                    bucket.setdefault("raw_dy", []).append(dy_sel.detach())
                     delattr(module, "_inftrace_x_raw")
             delattr(module, "_inftrace_v")
         return hook
@@ -450,6 +415,10 @@ class TokenInfluenceTracer:
         for name in self.storage:
             for key in self.storage[name]:
                 self.storage[name][key].clear()
+        for key in self._shared_meta:
+            self._shared_meta[key].clear()
+        self._shared_meta_count = 0
+        self._staged_meta = None
         self.current_capture = None
         self._anchor_activation = None
 
@@ -464,6 +433,7 @@ class TokenInfluenceTracer:
         row_ids: torch.Tensor,
         group_ids: torch.Tensor,
         accepted: torch.Tensor,
+        advantage: torch.Tensor | None = None,
     ) -> bool:
         self._debug["capture_begin_calls"] += 1
         response_len = response_mask.shape[1]
@@ -520,6 +490,7 @@ class TokenInfluenceTracer:
             "token_pos": tok_valid[keep].to(torch.int64),
             "group_id": group_ids[row_valid].to(torch.int64),
             "accepted": accepted[row_valid].to(torch.bool),
+            "advantage": advantage[row_valid].to(torch.float32) if advantage is not None else torch.zeros(row_valid.shape[0], device=indices.device, dtype=torch.float32),
             "response_len": torch.tensor(response_len, device=indices.device, dtype=torch.int64),
         }
         return True
@@ -611,16 +582,107 @@ class TokenInfluenceTracer:
         u_g: torch.Tensor,
         v_g: torch.Tensor,
         acc_g: torch.Tensor,
+        adv_g: torch.Tensor | None,
         stride: int,
+        use_global: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         uniq_rows, inv = torch.unique(row_g, sorted=True, return_inverse=True)
+
+        n_tokens = int(u_g.shape[0])
+        _empty = (
+            torch.empty(0, device=u_g.device, dtype=torch.int64),
+            torch.empty(0, device=u_g.device, dtype=torch.float32),
+        )
+        if n_tokens == 0:
+            return _empty
+
+        if self.cfg.contrastive_agg == "advantage":
+            if adv_g is None:
+                return _empty
+            row_adv = torch.zeros((uniq_rows.numel(),), device=u_g.device, dtype=torch.float32)
+            row_adv.index_put_((inv,), adv_g, accumulate=False)
+            if row_adv.abs().max() < 1e-8:
+                return _empty
+            # Advantage-weighted: M_full = Σ_k A_k · u_k v_k^T
+            token_adv = row_adv[inv]
+            weighted_u = u_g * token_adv.unsqueeze(-1)
+            m_full = weighted_u.transpose(0, 1) @ v_g  # [k_out, k_in]
+            scores = torch.sum((u_g @ m_full) * v_g, dim=-1)  # [n_tokens]
+            # Leave-one-out: subtract per-response self-contribution
+            for ridx in range(uniq_rows.numel()):
+                rmask = inv == ridx
+                u_r, v_r = u_g[rmask], v_g[rmask]
+                m_r = u_r.transpose(0, 1) @ v_r
+                self_contrib = torch.sum((u_g[rmask] @ m_r) * v_g[rmask], dim=-1)
+                scores[rmask] -= row_adv[ridx] * self_contrib
+            pair = row_g * stride + tok_g
+            return pair, scores
+
+        # --- Binary contrastive modes (sum / mean) ---
         row_acc = torch.zeros((uniq_rows.numel(),), device=u_g.device, dtype=torch.bool)
         row_acc.index_put_((inv,), acc_g, accumulate=False)
+
+        if use_global and self.cfg.contrastive_agg in ("sum", "mean"):
+            # --- Cross-GPU contrastive M (global_selected, identity mode) ---
+            # M = Σ u_i v_i^T for acc/rej groups. All-reduce M_acc, M_rej, counts.
+            # Counts are per-response (not per-token) to match mean-mode semantics.
+            k_out, k_in = u_g.shape[1], v_g.shape[1]
+            _dev, _dt = u_g.device, u_g.dtype
+            m_acc = (u_g[acc_g].T @ v_g[acc_g]) if acc_g.any() else torch.zeros(k_out, k_in, device=_dev, dtype=_dt)
+            m_rej = (u_g[~acc_g].T @ v_g[~acc_g]) if (~acc_g).any() else torch.zeros(k_out, k_in, device=_dev, dtype=_dt)
+            counts = torch.tensor([float(row_acc.sum()), float((~row_acc).sum())], device=_dev, dtype=_dt)
+            buf = torch.cat([m_acc.reshape(-1), m_rej.reshape(-1), counts])
+            torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+            flat_size = k_out * k_in
+            m_acc_g = buf[:flat_size].reshape(k_out, k_in)
+            m_rej_g = buf[flat_size:2*flat_size].reshape(k_out, k_in)
+            n_acc_g, n_rej_g = buf[2*flat_size].clamp(min=1), buf[2*flat_size+1].clamp(min=1)
+
+            if n_acc_g < 1 or n_rej_g < 1:
+                return _empty
+
+            if self.cfg.contrastive_agg == "mean":
+                m_global = m_acc_g / n_acc_g - m_rej_g / n_rej_g
+            else:
+                m_global = m_acc_g - m_rej_g
+            scores = torch.sum((u_g @ m_global) * v_g, dim=-1)  # [n_tokens]
+
+            if self.cfg.exclude_self_response:
+                for ridx in range(uniq_rows.numel()):
+                    rmask = inv == ridx
+                    u_r, v_r = u_g[rmask], v_g[rmask]
+                    m_r = u_r.T @ v_r  # [k_out, k_in]
+                    correction = torch.sum((u_g[rmask] @ m_r) * v_g[rmask], dim=-1)
+                    is_acc = bool(row_acc[ridx].item())
+                    if self.cfg.contrastive_agg == "mean":
+                        if is_acc:
+                            w_self = 1.0 / n_acc_g
+                            w_loo = 1.0 / (n_acc_g - 1).clamp(min=1)
+                        else:
+                            w_self = -1.0 / n_rej_g
+                            w_loo = -1.0 / (n_rej_g - 1).clamp(min=1)
+                        scores[rmask] -= w_self * correction
+                        _scale = self.cfg.self_influence_scale
+                        if _scale <= 0:
+                            pass  # full exclude: already removed
+                        elif _scale < 1:
+                            scores[rmask] += _scale * w_self * correction
+                        else:
+                            scores[rmask] += w_self * correction
+                    else:
+                        sign = 1.0 if is_acc else -1.0
+                        _scale = self.cfg.self_influence_scale
+                        if _scale <= 0:
+                            scores[rmask] -= sign * correction
+                        elif _scale < 1:
+                            scores[rmask] -= (1.0 - _scale) * sign * correction
+
+            pair = row_g * stride + tok_g
+            return pair, scores
+
+        # --- Local contrastive (all_selected / per_prompt) ---
         if bool(row_acc.all().item()) or bool((~row_acc).all().item()):
-            return (
-                torch.empty(0, device=u_g.device, dtype=torch.int64),
-                torch.empty(0, device=u_g.device, dtype=torch.float32),
-            )
+            return _empty
 
         if self.cfg.contrastive_agg == "mean":
             n_acc = row_acc.sum().float().clamp(min=1)
@@ -630,13 +692,6 @@ class TokenInfluenceTracer:
             row_weight = torch.where(row_acc, 1.0, -1.0)
         token_weight = row_weight.index_select(0, inv)
         weighted_u = u_g * token_weight.unsqueeze(-1)
-
-        n_tokens = int(u_g.shape[0])
-        if n_tokens == 0:
-            return (
-                torch.empty(0, device=u_g.device, dtype=torch.int64),
-                torch.empty(0, device=u_g.device, dtype=torch.float32),
-            )
 
         # For identity mode:
         # infl(t->r) = g_r^T g_t
@@ -655,9 +710,23 @@ class TokenInfluenceTracer:
                 m_r = u_r.transpose(0, 1) @ v_r  # [k_out, k_in]
                 correction = torch.sum((u_g[rmask] @ m_r) * v_g[rmask], dim=-1)
                 scores[rmask] -= row_weight[ridx] * correction
+                # Add back scaled self-influence
+                if self.cfg.self_influence_scale > 0:
+                    scores[rmask] += self.cfg.self_influence_scale * row_weight[ridx] * correction
 
         pair = row_g * stride + tok_g
         return pair, scores
+
+    def _stage_shared_meta(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """Stage shared metadata once, cache for reuse across modules."""
+        if not hasattr(self, "_staged_meta") or self._staged_meta is None:
+            row_id = self._cat_and_stage(self._shared_meta["row_id"], device=device, dtype=torch.int64)
+            token_pos = self._cat_and_stage(self._shared_meta["token_pos"], device=device, dtype=torch.int64)
+            group_id = self._cat_and_stage(self._shared_meta["group_id"], device=device, dtype=torch.int64)
+            accepted = self._cat_and_stage(self._shared_meta["accepted"], device=device, dtype=torch.bool)
+            advantage = self._cat_and_stage(self._shared_meta["advantage"], device=device, dtype=torch.float32)
+            self._staged_meta = (row_id, token_pos, group_id, accepted, advantage)
+        return self._staged_meta
 
     def _module_token_scores(self, module_name: str) -> tuple[torch.Tensor, torch.Tensor, int]:
         bucket = self.storage[module_name]
@@ -667,22 +736,14 @@ class TokenInfluenceTracer:
                 torch.empty(0, device="cpu", dtype=torch.float32),
                 0,
             )
-        do_timing = self.cfg.profile_timing and torch.cuda.is_available()
-
-        def _sync() -> None:
-            if do_timing:
-                torch.cuda.synchronize()
 
         compute_device = self._module_compute_device(module_name)
-        _sync()
         t_stage = time.perf_counter()
+        # Stage u, v from bf16 to fp32 on compute device
         u = self._cat_and_stage(bucket["u"], device=compute_device, dtype=torch.float32)
         v = self._cat_and_stage(bucket["v"], device=compute_device, dtype=torch.float32)
-        row_id = self._cat_and_stage(bucket["row_id"], device=compute_device, dtype=torch.int64)
-        token_pos = self._cat_and_stage(bucket["token_pos"], device=compute_device, dtype=torch.int64)
-        group_id = self._cat_and_stage(bucket["group_id"], device=compute_device, dtype=torch.int64)
-        accepted = self._cat_and_stage(bucket["accepted"], device=compute_device, dtype=torch.bool)
-        _sync()
+        # Use shared metadata (staged once, reused across all modules)
+        row_id, token_pos, group_id, accepted, advantage = self._stage_shared_meta(compute_device)
         self._timing["grad_staging_s"] += time.perf_counter() - t_stage
 
         if not self._compute_mode_logged and self._is_rank0():
@@ -694,7 +755,13 @@ class TokenInfluenceTracer:
             self._compute_mode_logged = True
         response_len = int(self.current_capture["response_len"].item()) if self.current_capture is not None else int(token_pos.max().item()) + 1
         stride = response_len + 1
-        use_all_selected = self.cfg.accepted_rejected_scope == "all_selected"
+        use_all_selected = self.cfg.accepted_rejected_scope in ("all_selected", "global_selected")
+        use_global = (
+            self.cfg.accepted_rejected_scope == "global_selected"
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
         unique_groups = [None] if use_all_selected else torch.unique(group_id, sorted=True).tolist()
         pair_out: list[torch.Tensor] = []
         score_out: list[torch.Tensor] = []
@@ -713,8 +780,8 @@ class TokenInfluenceTracer:
             u_g = u[g_mask]
             v_g = v[g_mask]
             acc_g = accepted[g_mask]
+            adv_g = advantage[g_mask]
             if self.cfg.hessian_mode == "identity":
-                _sync()
                 t_tok = time.perf_counter()
                 pair, score = self._module_token_scores_identity(
                     row_g=row_g,
@@ -722,14 +789,14 @@ class TokenInfluenceTracer:
                     u_g=u_g,
                     v_g=v_g,
                     acc_g=acc_g,
+                    adv_g=adv_g,
                     stride=stride,
+                    use_global=use_global,
                 )
-                _sync()
                 self._timing["token_scoring_s"] += time.perf_counter() - t_tok
                 if pair.numel() == 0:
                     continue
             else:
-                _sync()
                 t_tok = time.perf_counter()
                 g_tok = torch.bmm(u_g.unsqueeze(2), v_g.unsqueeze(1)).reshape(u_g.shape[0], -1)
                 uniq_rows, inv = torch.unique(row_g, sorted=True, return_inverse=True)
@@ -737,22 +804,26 @@ class TokenInfluenceTracer:
                 g_resp.index_add_(0, inv, g_tok)
                 row_acc = torch.zeros((uniq_rows.numel(),), device=g_tok.device, dtype=torch.bool)
                 row_acc.index_put_((inv,), acc_g, accumulate=False)
-                if bool(row_acc.all().item()) or bool((~row_acc).all().item()):
+                # For advantage mode, get per-response advantage values
+                if self.cfg.contrastive_agg == "advantage":
+                    row_adv = torch.zeros((uniq_rows.numel(),), device=g_tok.device, dtype=torch.float32)
+                    row_adv.index_put_((inv,), adv_g, accumulate=False)
+                    if row_adv.abs().max() < 1e-8:
+                        self._debug["groups_skipped_all_same"] += 1
+                        self._timing["token_scoring_s"] += time.perf_counter() - t_tok
+                        continue
+                elif not use_global and (bool(row_acc.all().item()) or bool((~row_acc).all().item())):
                     self._debug["groups_skipped_all_same"] += 1
-                    _sync()
                     self._timing["token_scoring_s"] += time.perf_counter() - t_tok
                     continue
-                _sync()
                 self._timing["token_scoring_s"] += time.perf_counter() - t_tok
 
-                _sync()
                 t_hess = time.perf_counter()
                 hess_source = g_tok if self.cfg.hessian_source == "token" else g_resp
                 solved = self._compute_kernel_solve(
                     g_resp=hess_source, g_tok=g_tok,
                     reg_lambda=self.cfg.reg_lambda,
                 )
-                _sync()
                 self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
 
                 # --- Hessian similarity diagnostic ---
@@ -782,40 +853,101 @@ class TokenInfluenceTracer:
                         rid = int(uniq_rows[k].item())
                         self._grad_row_meta[rid] = (bool(row_acc[k].item()), _gid_int)
 
-                _sync()
                 t_tok2 = time.perf_counter()
-                infl = g_resp @ solved  # [n_resp, n_tokens]
-                if self.cfg.contrastive_agg == "mean":
-                    score = infl[row_acc].mean(dim=0) - infl[~row_acc].mean(dim=0)
-                else:
-                    score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
 
-                if self.cfg.exclude_self_response:
-                    self_infl = infl[inv, torch.arange(inv.numel(), device=inv.device)]
+                if use_global and self.cfg.contrastive_agg in ("sum", "mean"):
+                    # --- Cross-GPU contrastive direction (global_selected) ---
+                    # All-reduce gradient sums to form a global d, keep Hessian solve local.
+                    D = g_resp.shape[1]
+                    _dev = g_resp.device
+                    _dt = g_resp.dtype
+                    sum_acc = g_resp[row_acc].sum(0) if row_acc.any() else torch.zeros(D, device=_dev, dtype=_dt)
+                    sum_rej = g_resp[~row_acc].sum(0) if (~row_acc).any() else torch.zeros(D, device=_dev, dtype=_dt)
+                    counts = torch.tensor([float(row_acc.sum()), float((~row_acc).sum())], device=_dev, dtype=_dt)
+                    buf = torch.cat([sum_acc, sum_rej, counts])
+                    torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+                    sum_acc_g, sum_rej_g = buf[:D], buf[D:2*D]
+                    n_acc_g, n_rej_g = buf[2*D].clamp(min=1), buf[2*D+1].clamp(min=1)
+
+                    if n_acc_g < 1 or n_rej_g < 1:
+                        self._debug["groups_skipped_all_same"] += 1
+                        self._timing["token_scoring_s"] += time.perf_counter() - t_tok2
+                        continue
+
                     if self.cfg.contrastive_agg == "mean":
-                        n_acc = row_acc.sum().float()
-                        n_rej = (~row_acc).sum().float()
-                        sum_acc = infl[row_acc].sum(dim=0)
-                        sum_rej = infl[~row_acc].sum(dim=0)
-                        score = torch.where(
-                            acc_g,
-                            (sum_acc - self_infl) / (n_acc - 1).clamp(min=1) - sum_rej / n_rej.clamp(min=1),
-                            sum_acc / n_acc.clamp(min=1) - (sum_rej - self_infl) / (n_rej - 1).clamp(min=1),
-                        )
+                        d_global = sum_acc_g / n_acc_g - sum_rej_g / n_rej_g
                     else:
-                        sign_per_token = torch.where(acc_g, 1.0, -1.0)
-                        score -= sign_per_token * self_infl
+                        d_global = sum_acc_g - sum_rej_g
+                    score = d_global @ solved  # [n_tokens]
+
+                    # Leave-one-out with global statistics
+                    if self.cfg.exclude_self_response:
+                        local_infl = g_resp @ solved  # [n_resp_local, n_tokens]
+                        self_infl = local_infl[inv, torch.arange(inv.numel(), device=inv.device)]
+                        if self.cfg.contrastive_agg == "mean":
+                            sum_acc_score = sum_acc_g @ solved  # [n_tokens]
+                            sum_rej_score = sum_rej_g @ solved  # [n_tokens]
+                            score_exclude = torch.where(
+                                acc_g,
+                                (sum_acc_score - self_infl) / (n_acc_g - 1).clamp(min=1) - sum_rej_score / n_rej_g,
+                                sum_acc_score / n_acc_g - (sum_rej_score - self_infl) / (n_rej_g - 1).clamp(min=1),
+                            )
+                        else:
+                            sign_per_token = torch.where(acc_g, 1.0, -1.0)
+                            score_exclude = score - sign_per_token * self_infl
+                        _scale = self.cfg.self_influence_scale
+                        if _scale <= 0:
+                            score = score_exclude
+                        elif _scale < 1:
+                            score = (1.0 - _scale) * score_exclude + _scale * score
+                else:
+                    # --- Local contrastive scoring (all_selected / per_prompt) ---
+                    infl = g_resp @ solved  # [n_resp, n_tokens]
+                    if self.cfg.contrastive_agg == "advantage":
+                        full_score = (row_adv.unsqueeze(1) * infl).sum(dim=0)
+                        self_contrib = row_adv[inv] * infl[inv, torch.arange(inv.numel(), device=inv.device)]
+                        score = full_score - self_contrib
+                    elif self.cfg.contrastive_agg == "mean":
+                        score = infl[row_acc].mean(dim=0) - infl[~row_acc].mean(dim=0)
+                    else:
+                        score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
+
+                    if self.cfg.exclude_self_response and self.cfg.contrastive_agg != "advantage":
+                        self_infl = infl[inv, torch.arange(inv.numel(), device=inv.device)]
+                        score_include = score
+                        if self.cfg.contrastive_agg == "mean":
+                            n_acc = row_acc.sum().float()
+                            n_rej = (~row_acc).sum().float()
+                            sum_acc = infl[row_acc].sum(dim=0)
+                            sum_rej = infl[~row_acc].sum(dim=0)
+                            score_exclude = torch.where(
+                                acc_g,
+                                (sum_acc - self_infl) / (n_acc - 1).clamp(min=1) - sum_rej / n_rej.clamp(min=1),
+                                sum_acc / n_acc.clamp(min=1) - (sum_rej - self_infl) / (n_rej - 1).clamp(min=1),
+                            )
+                        else:
+                            sign_per_token = torch.where(acc_g, 1.0, -1.0)
+                            score_exclude = score_include - sign_per_token * self_infl
+
+                        _scale = self.cfg.self_influence_scale
+                        if _scale <= 0:
+                            score = score_exclude
+                        elif _scale >= 1:
+                            score = score_include
+                        else:
+                            score = (1.0 - _scale) * score_exclude + _scale * score_include
+
+                # --- Per-token normalization to remove gradient magnitude ---
+                if self.cfg.score_normalization == "h_inv_norm":
+                    h_inv_norm_sq = (g_tok * solved.T).sum(dim=-1)  # [n_tokens]
+                    h_inv_norm = h_inv_norm_sq.clamp(min=1e-8).sqrt()
+                    score = score / h_inv_norm
 
                 pair = row_g * stride + tok_g
-                _sync()
                 self._timing["token_scoring_s"] += time.perf_counter() - t_tok2
 
-            _sync()
-            t_agg = time.perf_counter()
             pair_out.append(pair)
             score_out.append(score)
-            _sync()
-            self._timing["score_aggregation_s"] += time.perf_counter() - t_agg
 
         # Accumulate gradient dot products for this module across all groups
         if _diag_grads and self.cfg.debug_hessian_similarity and self._is_rank0():
@@ -828,16 +960,16 @@ class TokenInfluenceTracer:
                 torch.empty(0, device="cpu", dtype=torch.float32),
                 response_len,
             )
-        _sync()
         t_agg_final = time.perf_counter()
         result = torch.cat(pair_out, dim=0), torch.cat(score_out, dim=0), response_len
-        _sync()
         self._timing["score_aggregation_s"] += time.perf_counter() - t_agg_final
         return result
 
     def pop_token_influence_rows(self) -> list[dict[str, Any]]:
         if not self.storage:
             return []
+        # Reset staged metadata cache so it gets rebuilt for scoring
+        self._staged_meta = None
         score_map: torch.Tensor | None = None
         token_seen: torch.Tensor | None = None
         row_seen: torch.Tensor | None = None
@@ -1281,7 +1413,7 @@ class TokenInfluenceTracer:
         )
 
         # Process the first mixed group
-        use_all_selected = self.cfg.accepted_rejected_scope == "all_selected"
+        use_all_selected = self.cfg.accepted_rejected_scope in ("all_selected", "global_selected")
         unique_groups = [None] if use_all_selected else torch.unique(group_id, sorted=True).tolist()
         for gid in unique_groups:
             if gid is None:

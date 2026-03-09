@@ -103,6 +103,15 @@ def _prepare_influence_trace_batch(
     batch.batch["influence_trace_reward"] = seq_rewards.to(torch.float32)
     batch.batch["influence_trace_accepted"] = accepted.to(torch.bool)
     batch.batch["influence_trace_uid_hash"] = torch.from_numpy(uid_hash)
+    # Per-response scalar advantage for advantage-weighted contrastive mode
+    if "advantages" in batch.batch:
+        adv = batch.batch["advantages"]  # [bs, response_length], uniform per response in GRPO
+        resp_mask = batch.batch.get("response_mask", torch.ones_like(adv))
+        adv_sum = (adv * resp_mask).sum(dim=-1)
+        resp_len = resp_mask.sum(dim=-1).clamp(min=1)
+        batch.batch["influence_trace_advantage"] = (adv_sum / resp_len).detach().to(torch.float32).cpu()
+    else:
+        batch.batch["influence_trace_advantage"] = torch.zeros(batch_size, dtype=torch.float32)
     debug_counts = {
         "uid_total": int(len(uid_to_indices)),
         "uid_constant": int(uid_constant),
@@ -466,9 +475,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "force_gpu_compute": bool(influence_trace_cfg.get("force_gpu_compute", True)),
                                 "profile_timing": bool(influence_trace_cfg.get("profile_timing", False)),
                                 "exclude_self_response": bool(influence_trace_cfg.get("exclude_self_response", False)),
+                                "self_influence_scale": float(influence_trace_cfg.get("self_influence_scale", 0.0)),
                                 "contrastive_agg": str(influence_trace_cfg.get("contrastive_agg", "sum")),
                                 "hessian_source": str(influence_trace_cfg.get("hessian_source", "response")),
                                 "debug_hessian_similarity": bool(influence_trace_cfg.get("debug_hessian_similarity", False)),
+                                "score_normalization": str(influence_trace_cfg.get("score_normalization", "none")),
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}
@@ -485,6 +496,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                             "weight_clamp_max": float(influence_token_weight_cfg.get("weight_clamp_max", 5.0)),
                             "tanh_alpha": float(influence_token_weight_cfg.get("tanh_alpha", 0.5)),
                             "tanh_tau": float(influence_token_weight_cfg.get("tanh_tau", 1.0)),
+                            "direct_lambda": float(influence_token_weight_cfg.get("direct_lambda", 0.3)),
+                            "direct_clamp_min": float(influence_token_weight_cfg.get("direct_clamp_min", 0.0)),
+                            "direct_clamp_max": float(influence_token_weight_cfg.get("direct_clamp_max", 2.0)),
+                            "adv_target": str(influence_token_weight_cfg.get("adv_target", "advantage")),
+                            "ratio_clamp_min": float(influence_token_weight_cfg.get("ratio_clamp_min", -1.0)),
+                            "ratio_clamp_max": float(influence_token_weight_cfg.get("ratio_clamp_max", 3.0)),
+                            "ratio_snr_threshold": float(influence_token_weight_cfg.get("ratio_snr_threshold", 0.3)),
                         }
                         # update actor
                         with _timer("update_actor", timing_raw):
