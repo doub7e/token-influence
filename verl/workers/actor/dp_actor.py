@@ -825,7 +825,7 @@ class DataParallelPPOActor(BasePPOActor):
                     token_weights_for_loss = None
                     if token_weights is not None:
                         if (
-                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio")
+                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio", "additive")
                             and influence_token_weight_cfg.adv_target == "advantage"
                         ):
                             advantages = advantages * token_weights

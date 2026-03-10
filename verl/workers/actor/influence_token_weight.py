@@ -36,6 +36,11 @@ class InfluenceTokenWeightConfig:
     ratio_clamp_min: float = -1.0  # min weight after ratio (<0 allows sign flip)
     ratio_clamp_max: float = 3.0  # max weight after ratio
     ratio_snr_threshold: float = 0.3  # fallback to uniform when |μ_i/σ_i| < threshold
+    # additive mode params: w_t = 1 + λ * z_t where z_t = (s_t - mean) / std
+    # Redistributes response advantage budget by token influence. mean(w_t) = 1.
+    additive_lambda: float = 0.5  # redistribution strength
+    additive_clamp_min: float = -1.0  # min weight (< 0 allows sign flip)
+    additive_clamp_max: float = 3.0  # max weight
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InfluenceTokenWeightConfig":
@@ -59,6 +64,9 @@ class InfluenceTokenWeightConfig:
             ratio_clamp_min=float(d.get("ratio_clamp_min", -1.0)),
             ratio_clamp_max=float(d.get("ratio_clamp_max", 3.0)),
             ratio_snr_threshold=float(d.get("ratio_snr_threshold", 0.3)),
+            additive_lambda=float(d.get("additive_lambda", 0.5)),
+            additive_clamp_min=float(d.get("additive_clamp_min", -1.0)),
+            additive_clamp_max=float(d.get("additive_clamp_max", 3.0)),
         )
 
 
@@ -177,6 +185,27 @@ def build_token_loss_weights(
                 w = w / w_mean
             else:
                 continue  # degenerate after clamp → uniform
+            weights[i, valid] = w.to(weights.dtype)
+            influenced[i] = valid
+            continue
+
+        if config.mode == "additive":
+            # Additive mode: w_t = 1 + λ × z_t, z_t = (s_t - mean) / std
+            # Redistributes advantage budget: mean(w_t) = 1 (before clamp).
+            valid_s = scores[valid]
+            mu = valid_s.mean()
+            sigma = valid_s.std()
+            if sigma < 1e-8:
+                continue  # all same score → keep uniform
+            z = (valid_s - mu) / sigma
+            w = 1.0 + config.additive_lambda * z
+            w = w.clamp(config.additive_clamp_min, config.additive_clamp_max)
+            # Re-normalize mean to 1 after clamping
+            w_mean = w.mean()
+            if w_mean.abs() > 1e-8:
+                w = w / w_mean
+            else:
+                continue
             weights[i, valid] = w.to(weights.dtype)
             influenced[i] = valid
             continue
