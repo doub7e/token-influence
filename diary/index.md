@@ -4,6 +4,9 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-03-16 | Credit & Mask Mode Token Influence Experiments | `d13eebf` | `diary/2026-03-16-credit-mask-mode-experiments-d13eebf.md` |
+| 2026-03-09 | Additive Influence Token Weight Mode (λ sweep) | `81d699c` | `diary/2026-03-09-additive-influence-token-weight-mode-81d699c.md` |
+| 2026-03-09 | Cross-GPU Contrastive Direction (`global_selected` Mode) | `f4075f0` | `diary/2026-03-09-global-selected-cross-gpu-contrastive-f4075f0.md` |
 | 2026-03-05 | Qwen3-1.7B-Base GRPO: PPO Epoch & Clipping Sweep (Zero Reg) | `bd4d008` | `diary/2026-03-05-qwen3-ppo-epoch-clip-sweep.md` |
 | 2026-03-04 | Qwen3-1.7B-Base GRPO: Entropy Stabilization & MATH-500 Eval | `bf8e43f` | `diary/2026-03-04-qwen3-1.7b-base-grpo-entropy-tuning.md` |
 | 2026-03-04 | Influence Token Weight: Tanh Mode + Softmax Eval + Deep Analysis | `531ffc0` | `diary/2026-03-04-influence-token-weight-tanh-mode.md` |
