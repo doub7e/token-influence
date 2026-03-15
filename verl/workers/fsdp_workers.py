@@ -631,9 +631,13 @@ class ActorRolloutRefWorker(Worker):
 
             # TODO: here, we should return all metrics
             influence_rows = self.actor.pop_influence_trace_rows()
+            token_weight_cache = self.actor.pop_token_weight_cache()
             output = DataProto(
                 meta_info={"metrics": metrics},
-                non_tensor_batch={"influence_trace_rows": np.array(influence_rows, dtype=object)},
+                non_tensor_batch={
+                    "influence_trace_rows": np.array(influence_rows, dtype=object),
+                    "token_weight_cache": np.array([token_weight_cache], dtype=object),
+                },
             )
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)

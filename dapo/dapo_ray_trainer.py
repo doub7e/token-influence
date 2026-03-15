@@ -480,6 +480,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "hessian_source": str(influence_trace_cfg.get("hessian_source", "response")),
                                 "debug_hessian_similarity": bool(influence_trace_cfg.get("debug_hessian_similarity", False)),
                                 "score_normalization": str(influence_trace_cfg.get("score_normalization", "none")),
+                                "token_unit_norm": bool(influence_trace_cfg.get("token_unit_norm", False)),
                             }
                         else:
                             batch.meta_info["influence_trace_cfg"] = {"enable": False}
@@ -503,6 +504,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                             "ratio_clamp_min": float(influence_token_weight_cfg.get("ratio_clamp_min", -1.0)),
                             "ratio_clamp_max": float(influence_token_weight_cfg.get("ratio_clamp_max", 3.0)),
                             "ratio_snr_threshold": float(influence_token_weight_cfg.get("ratio_snr_threshold", 0.3)),
+                            "additive_lambda": float(influence_token_weight_cfg.get("additive_lambda", 0.5)),
+                            "additive_clamp_min": float(influence_token_weight_cfg.get("additive_clamp_min", -1.0)),
+                            "additive_clamp_max": float(influence_token_weight_cfg.get("additive_clamp_max", 3.0)),
+                            "apply_to": str(influence_token_weight_cfg.get("apply_to", "all")),
                         }
                         # update actor
                         with _timer("update_actor", timing_raw):
@@ -511,12 +516,23 @@ class RayDAPOTrainer(RayPPOTrainer):
                         metrics.update(actor_output_metrics)
                         if bool(influence_trace_cfg.get("enable", False)):
                             influence_rows = actor_output.non_tensor_batch.get("influence_trace_rows")
+                            # Extract token weight cache from actor output (merge all ranks)
+                            tw_cache_arr = actor_output.non_tensor_batch.get("token_weight_cache")
+                            tw_cache = None
+                            if tw_cache_arr is not None and len(tw_cache_arr) > 0:
+                                tw_cache = {}
+                                for shard in tw_cache_arr:
+                                    if isinstance(shard, dict):
+                                        tw_cache.update(shard)
+                            _tw_default = 0.0 if influence_token_weight_cfg.get("mode", "zero") == "credit" else 1.0
                             influence_trace_writer.write_step(
                                 step=self.global_steps,
                                 batch=batch,
                                 entropies=entropys,
                                 response_mask=response_masks,
                                 influence_rows=influence_rows,
+                                token_weight_cache=tw_cache,
+                                token_weight_default=_tw_default,
                             )
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):

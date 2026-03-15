@@ -165,6 +165,8 @@ class RolloutInfluenceTraceWriter:
         entropies: torch.Tensor,
         response_mask: torch.Tensor,
         influence_rows: np.ndarray | None,
+        token_weight_cache: dict[int, np.ndarray] | None = None,
+        token_weight_default: float = 1.0,
     ) -> None:
         if not self.enabled:
             return
@@ -213,6 +215,18 @@ class RolloutInfluenceTraceWriter:
             "group_id": group_ids.astype(np.int32),
             "prompt_ids": prompt_ids,
         }
+        # Add per-token weights (w_t) if available
+        if token_weight_cache:
+            tw_array = np.full(ent.shape, token_weight_default, dtype=np.float16)
+            for i, row_id in enumerate(selected_rows.tolist()):
+                if row_id in token_weight_cache:
+                    tw = token_weight_cache[row_id]
+                    target_len = int(tw_array.shape[1])
+                    src_len = int(tw.shape[0])
+                    copy_len = min(src_len, target_len)
+                    if copy_len > 0:
+                        tw_array[i, :copy_len] = tw[:copy_len]
+            arrays["token_weight"] = tw_array
         if uid_sel is not None:
             arrays["uid"] = uid_sel
         if uid_hash is not None:

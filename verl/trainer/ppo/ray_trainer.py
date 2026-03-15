@@ -579,6 +579,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
+        max_response_length = self.config.data.max_response_length
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
         thinking_tokens_infos_dict: dict[str, list] = defaultdict(list)

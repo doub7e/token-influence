@@ -65,6 +65,7 @@ class InfluenceTraceConfig:
     hessian_source: str = "response"   # "response" or "token"
     debug_hessian_similarity: bool = False  # log cross-prompt Hessian similarity
     score_normalization: str = "none"  # "none" | "h_inv_norm" — per-token normalization to remove gradient magnitude
+    token_unit_norm: bool = False  # normalize per-token gradient vectors to unit norm before scoring (TrackStar-style)
 
     @staticmethod
     def from_meta(meta: dict[str, Any]) -> "InfluenceTraceConfig":
@@ -127,6 +128,7 @@ class InfluenceTraceConfig:
             hessian_source=hessian_source,
             debug_hessian_similarity=bool(raw.get("debug_hessian_similarity", False)),
             score_normalization=score_normalization,
+            token_unit_norm=bool(raw.get("token_unit_norm", False)),
         )
 
 
@@ -596,6 +598,11 @@ class TokenInfluenceTracer:
         if n_tokens == 0:
             return _empty
 
+        # TrackStar-style: normalize per-token projected gradients to unit norm
+        if self.cfg.token_unit_norm:
+            u_g = u_g / u_g.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            v_g = v_g / v_g.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
         if self.cfg.contrastive_agg == "advantage":
             if adv_g is None:
                 return _empty
@@ -800,6 +807,7 @@ class TokenInfluenceTracer:
                 t_tok = time.perf_counter()
                 g_tok = torch.bmm(u_g.unsqueeze(2), v_g.unsqueeze(1)).reshape(u_g.shape[0], -1)
                 uniq_rows, inv = torch.unique(row_g, sorted=True, return_inverse=True)
+
                 g_resp = torch.zeros((uniq_rows.numel(), g_tok.shape[1]), device=g_tok.device, dtype=g_tok.dtype)
                 g_resp.index_add_(0, inv, g_tok)
                 row_acc = torch.zeros((uniq_rows.numel(),), device=g_tok.device, dtype=torch.bool)
@@ -852,6 +860,24 @@ class TokenInfluenceTracer:
                     for k in range(uniq_rows.numel()):
                         rid = int(uniq_rows[k].item())
                         self._grad_row_meta[rid] = (bool(row_acc[k].item()), _gid_int)
+
+                # --- TrackStar: Mahalanobis-normalize tokens for direction & scoring ---
+                # ||H^{-1/2} g_t||^2 = g_t^T H^{-1} g_t = g_t . solved_t.
+                # Dividing g_t by this norm and scoring with solved/norm gives
+                # cosine similarity in the H^{-1/2} space — mathematically
+                # equivalent to explicitly computing H^{-1/2} g / ||H^{-1/2} g||.
+                # Both d (direction) and per-token scores are normalized,
+                # so no single high-magnitude token dominates.
+                if self.cfg.token_unit_norm:
+                    mahal_sq = (g_tok * solved.T).sum(dim=-1)  # [n_tokens]
+                    mahal = mahal_sq.clamp(min=1e-16).sqrt()
+                    # Only normalize the scoring side (solved / H^{-1} g_t),
+                    # keep g_resp built from raw g_tok so the contrastive
+                    # direction preserves natural gradient magnitudes — tokens
+                    # with larger gradients (more model impact) contribute more
+                    # to the accepted-vs-rejected direction.
+                    # g_resp is already computed from raw g_tok above.
+                    solved = solved / mahal.unsqueeze(0)  # [D, n_tokens]
 
                 t_tok2 = time.perf_counter()
 
@@ -937,8 +963,10 @@ class TokenInfluenceTracer:
                         else:
                             score = (1.0 - _scale) * score_exclude + _scale * score_include
 
-                # --- Per-token normalization to remove gradient magnitude ---
-                if self.cfg.score_normalization == "h_inv_norm":
+                # --- Per-token normalization (legacy h_inv_norm mode) ---
+                # Only applies when token_unit_norm is off; when on, the
+                # H^{-1/2} unit-normalization above already handles this.
+                if self.cfg.score_normalization == "h_inv_norm" and not self.cfg.token_unit_norm:
                     h_inv_norm_sq = (g_tok * solved.T).sum(dim=-1)  # [n_tokens]
                     h_inv_norm = h_inv_norm_sq.clamp(min=1e-8).sqrt()
                     score = score / h_inv_norm

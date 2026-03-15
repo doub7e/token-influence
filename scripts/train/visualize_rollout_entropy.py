@@ -174,8 +174,9 @@ def _render_token_heatmap(df: pd.DataFrame, lo: float, hi: float, influence_boun
             if valid:
                 inf_p = float(np.clip((influence_val + influence_bound) / (2.0 * influence_bound), 0.0, 1.0))
                 fg = "#333" if 0.3 < inf_p < 0.7 else "white"
+        tw_val = float(getattr(row, "token_weight", float("nan")))
         tooltip = html.escape(
-            f"pos={pos} id={int(row.token_id)} entropy={entropy:.5f} influence={influence_val:.5f} valid={valid}"
+            f"pos={pos} id={int(row.token_id)} entropy={entropy:.5f} influence={influence_val:.5f} w_t={tw_val:.4f} valid={valid}"
         )
         chunks.append(
             f"<span title='{tooltip}' style='display:inline-block;margin:2px;padding:4px 6px;border-radius:6px;"
@@ -243,6 +244,7 @@ def _flatten_topk(
 def _build_response_df(
     ent: np.ndarray,
     influence: np.ndarray | None,
+    token_weight: np.ndarray | None,
     mask: np.ndarray,
     responses: np.ndarray,
     tokenizer,
@@ -274,6 +276,7 @@ def _build_response_df(
                 "token": tok,
                 "entropy": float(e),
                 "influence": float(influence[response_idx, pos]) if influence is not None else float("nan"),
+                "token_weight": float(token_weight[response_idx, pos]) if token_weight is not None else float("nan"),
                 "valid": bool(valid),
             }
         )
@@ -408,6 +411,7 @@ def main() -> None:
         payload = _load_step_npz(str(step_path))
         ent = payload["entropies"].astype(np.float32)
         influence = payload["influence"].astype(np.float32) if "influence" in payload else None
+        token_weight = payload["token_weight"].astype(np.float32) if "token_weight" in payload else None
         mask = payload["response_mask"].astype(bool)
         responses = payload["responses"].astype(np.int32)
         response_idx = int(np.clip(response_idx, 0, max(ent.shape[0] - 1, 0)))
@@ -421,6 +425,7 @@ def main() -> None:
         df = _build_response_df(
             ent=ent,
             influence=influence,
+            token_weight=token_weight,
             mask=mask,
             responses=responses,
             tokenizer=tokenizer,
@@ -447,10 +452,29 @@ def main() -> None:
             else:
                 inf_bound = 1.0
             influence_html = _render_token_heatmap(view_df, lo, hi, influence_bound=inf_bound)
+        # Token weight heatmap (diverging around center)
+        # Multiplicative modes center at 1.0, credit/additive-correction modes center at 0.0
+        tw_html = "<div style='padding:12px'>No token weights in this trace step.</div>"
+        if token_weight is not None:
+            tw_finite = token_weight[np.isfinite(token_weight) & mask]
+            if tw_finite.size:
+                tw_mean = float(np.mean(tw_finite))
+                tw_center = 0.0 if abs(tw_mean) < abs(tw_mean - 1.0) else 1.0
+                tw_dev = np.abs(tw_finite - tw_center)
+                tw_bound = float(np.quantile(tw_dev, 0.99))
+                if tw_bound < 1e-8:
+                    tw_bound = float(np.max(tw_dev))
+            else:
+                tw_center = 1.0
+                tw_bound = 1.0
+            tw_view = view_df.copy()
+            tw_view["influence"] = tw_view["token_weight"] - tw_center
+            tw_html = _render_token_heatmap(tw_view, lo, hi, influence_bound=tw_bound)
         token_html = (
             "<div style='display:flex;gap:16px'>"
             "<div style='flex:1'><h4>Entropy</h4>" + entropy_html + "</div>"
             "<div style='flex:1'><h4>Influence</h4>" + influence_html + "</div>"
+            "<div style='flex:1'><h4>Token Weight (w_t)</h4>" + tw_html + "</div>"
             "</div>"
         )
         prompt_preview = "N/A"

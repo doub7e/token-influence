@@ -41,6 +41,7 @@ class InfluenceTokenWeightConfig:
     additive_lambda: float = 0.5  # redistribution strength
     additive_clamp_min: float = -1.0  # min weight (< 0 allows sign flip)
     additive_clamp_max: float = 3.0  # max weight
+    apply_to: str = "all"  # "all" | "positive" | "negative" — which responses to weight
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InfluenceTokenWeightConfig":
@@ -67,6 +68,7 @@ class InfluenceTokenWeightConfig:
             additive_lambda=float(d.get("additive_lambda", 0.5)),
             additive_clamp_min=float(d.get("additive_clamp_min", -1.0)),
             additive_clamp_max=float(d.get("additive_clamp_max", 3.0)),
+            apply_to=str(d.get("apply_to", "all")),
         )
 
 
@@ -90,18 +92,23 @@ def build_token_loss_weights(
             If provided, used directly; otherwise falls back to advantage sign.
 
     Returns:
-        (weights, stats): weights is [batch_size, response_length] tensor;
-            stats is a dict of extra metrics (e.g. sign_guard_filtered count).
+        (weights, stats, per_row_weights): weights is [batch_size, response_length] tensor;
+            stats is a dict of extra metrics (e.g. sign_guard_filtered count);
+            per_row_weights is a dict[int, np.ndarray] mapping row_id to float16
+            weight arrays (for NPZ persistence / visualization).
     """
     bsz, seq_len = advantages.shape
-    weights = torch.ones(bsz, seq_len, device=advantages.device, dtype=advantages.dtype)
+    # For "credit" mode, weights are additive corrections (init 0); otherwise multiplicative (init 1)
+    _init_val = 0.0 if config.mode == "credit" else 1.0
+    weights = torch.full((bsz, seq_len), _init_val, device=advantages.device, dtype=advantages.dtype)
     stats: dict[str, float] = {}
+    per_row_weights: dict[int, np.ndarray] = {}
 
     if not config.enabled:
-        return weights, stats
+        return weights, stats, per_row_weights
 
     if not influence_cache:
-        return weights, stats
+        return weights, stats, per_row_weights
 
     # Determine accepted/rejected per row
     with torch.no_grad():
@@ -189,10 +196,82 @@ def build_token_loss_weights(
             influenced[i] = valid
             continue
 
+        if config.mode in ("mask", "mask_random", "mask_soft", "mask_threshold"):
+            # Mask family: modulate advantage based on influence sign.
+            # mask: hard 0/1 based on sign
+            # mask_random: same fraction masked but randomly (ablation control)
+            # mask_soft: wrong-direction tokens get weight=mask_soft_value instead of 0
+            # mask_threshold: only mask when |score| > threshold (z-scored), else keep weight=1
+            valid_s = scores[valid]
+
+            if config.mode == "mask_threshold":
+                # Z-score within response, then mask only confident wrong-direction tokens
+                mu = valid_s.mean()
+                sigma = valid_s.std()
+                if sigma < 1e-8:
+                    continue
+                z = (valid_s - mu) / sigma
+                if is_accepted[i]:
+                    mask_bad = z < -config.threshold  # confidently bad tokens
+                else:
+                    mask_bad = z > config.threshold   # confidently good tokens in rejected
+            else:
+                if is_accepted[i]:
+                    mask_bad = valid_s < 0
+                else:
+                    mask_bad = valid_s > 0
+
+            n_mask = int(mask_bad.sum().item())
+            if config.mode == "mask_random" and n_mask > 0:
+                mask_bad = torch.zeros_like(valid_s, dtype=torch.bool)
+                perm = torch.randperm(valid_s.numel(), device=valid_s.device)[:n_mask]
+                mask_bad[perm] = True
+
+            w = torch.ones_like(valid_s)
+            if config.mode == "mask_soft":
+                w[mask_bad] = config.weight_clamp_min  # soft value (e.g. 0.5)
+            else:
+                w[mask_bad] = 0.0
+            weights[i, valid] = w.to(weights.dtype)
+            influenced[i] = valid
+            continue
+
+        if config.mode == "credit":
+            # Credit mode: A'_t = A_t + correction_t (additive to advantage)
+            # Uses sign flip for rejected responses — same dense credit semantics
+            # as multiplicative sign-flip, but additive form should be more stable
+            # because correction is independent of A_t magnitude.
+            valid_s = scores[valid]
+            if not is_accepted[i]:
+                valid_s = -valid_s  # sign flip: high-influence tokens in rejected → negative correction
+            mu = valid_s.mean()
+            sigma = valid_s.std()
+            if sigma < 1e-8:
+                continue  # all same score → keep correction=0
+            z = (valid_s - mu) / sigma
+            correction = config.additive_lambda * z
+            correction = correction.clamp(config.additive_clamp_min, config.additive_clamp_max)
+            weights[i, valid] = correction.to(weights.dtype)
+            influenced[i] = valid
+            continue
+
         if config.mode == "additive":
             # Additive mode: w_t = 1 + λ × z_t, z_t = (s_t - mean) / std
-            # Redistributes advantage budget: mean(w_t) = 1 (before clamp).
+            # Dense credit assignment: for rejected responses, flip score sign
+            # so that "good tokens" (high influence, promoting accepted) get
+            # w < 1 (less suppression) and "bad tokens" get w > 1 (more
+            # suppression). Clamp range should be tight (e.g. [0, 2]) to
+            # limit noise amplification when scores are unreliable.
+            # Skip responses based on apply_to setting
+            if config.apply_to == "positive" and not is_accepted[i]:
+                continue  # keep w=1 for rejected responses
+            if config.apply_to == "negative" and is_accepted[i]:
+                continue  # keep w=1 for accepted responses
             valid_s = scores[valid]
+            # Sign flip for rejected: "all" flips (dense credit), "noflip_neg"
+            # keeps original score direction for rejected (saliency on neg side).
+            if not is_accepted[i] and config.apply_to not in ("noflip_neg",):
+                valid_s = -valid_s
             mu = valid_s.mean()
             sigma = valid_s.std()
             if sigma < 1e-8:
@@ -200,12 +279,6 @@ def build_token_loss_weights(
             z = (valid_s - mu) / sigma
             w = 1.0 + config.additive_lambda * z
             w = w.clamp(config.additive_clamp_min, config.additive_clamp_max)
-            # Re-normalize mean to 1 after clamping
-            w_mean = w.mean()
-            if w_mean.abs() > 1e-8:
-                w = w / w_mean
-            else:
-                continue
             weights[i, valid] = w.to(weights.dtype)
             influenced[i] = valid
             continue
@@ -299,6 +372,12 @@ def build_token_loss_weights(
                 perm = torch.randperm(n_inf, device=inf_w.device)
                 weights[i, mask] = inf_w[perm]
 
+    # Build per-row weight arrays for NPZ persistence / visualization
+    for i in range(bsz):
+        rid = int(row_ids[i].item())
+        row_w = weights[i].detach().cpu().to(torch.float32).numpy().astype(np.float16)
+        per_row_weights[rid] = row_w
+
     # Populate stats
     stats["cache_hits"] = float(cache_hits)
     stats["cache_misses"] = float(cache_misses)
@@ -325,4 +404,4 @@ def build_token_loss_weights(
                 if k.startswith("_dbg_"):
                     print(f"  {k}={v}")
 
-    return weights, stats
+    return weights, stats, per_row_weights

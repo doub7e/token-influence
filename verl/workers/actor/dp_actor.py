@@ -86,11 +86,17 @@ class DataParallelPPOActor(BasePPOActor):
         self._influence_cfg: InfluenceTraceConfig | None = None
         self._influence_tracer: TokenInfluenceTracer | None = None
         self._influence_rows: list[dict[str, Any]] = []
+        self._token_weight_cache: dict[int, "np.ndarray"] = {}
 
     def pop_influence_trace_rows(self) -> list[dict[str, Any]]:
         rows = self._influence_rows
         self._influence_rows = []
         return rows
+
+    def pop_token_weight_cache(self) -> dict[int, "np.ndarray"]:
+        cache = self._token_weight_cache
+        self._token_weight_cache = {}
+        return cache
 
     def _setup_influence_trace(self, meta_info: dict[str, Any]) -> bool:
         cfg = InfluenceTraceConfig.from_meta(meta_info)
@@ -458,6 +464,7 @@ class DataParallelPPOActor(BasePPOActor):
             data.meta_info.get("influence_token_weight_cfg", {})
         )
         _cached_influence: dict[int, "np.ndarray"] = {}  # row_id -> influence array
+        _cached_token_weights: dict[int, "np.ndarray"] = {}  # row_id -> token weight array
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
@@ -797,7 +804,7 @@ class DataParallelPPOActor(BasePPOActor):
                         if "influence_trace_accepted" in data:
                             _accepted = data["influence_trace_accepted"].bool()
                         _row_ids = data["influence_trace_row_id"].to(torch.long)
-                        token_weights, tw_stats = build_token_loss_weights(
+                        token_weights, tw_stats, tw_per_row = build_token_loss_weights(
                             influence_cache=_cached_influence,
                             row_ids=_row_ids,
                             advantages=advantages,
@@ -805,6 +812,7 @@ class DataParallelPPOActor(BasePPOActor):
                             config=influence_token_weight_cfg,
                             accepted=_accepted,
                         )
+                        _cached_token_weights.update(tw_per_row)
                         masked_frac = float((token_weights != 1.0).float().sum() / max(response_mask.sum(), 1))
                         append_to_dict(metrics, {"actor/token_weight_masked_frac": masked_frac})
                         # Log sign guard stats
@@ -824,8 +832,11 @@ class DataParallelPPOActor(BasePPOActor):
                     # Apply influence weights: direct mode targets advantages, others target loss
                     token_weights_for_loss = None
                     if token_weights is not None:
-                        if (
-                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio", "additive")
+                        if influence_token_weight_cfg.mode == "credit" and influence_token_weight_cfg.adv_target == "advantage":
+                            # Credit mode: additive correction A'_t = A_t + correction_t
+                            advantages = advantages + token_weights
+                        elif (
+                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio", "additive", "mask", "mask_random", "mask_soft", "mask_threshold")
                             and influence_token_weight_cfg.adv_target == "advantage"
                         ):
                             advantages = advantages * token_weights
@@ -1027,6 +1038,8 @@ class DataParallelPPOActor(BasePPOActor):
                 },
             )
         self.actor_optimizer.zero_grad()
+        # Store token weight cache for NPZ persistence
+        self._token_weight_cache = _cached_token_weights
         # Aggressively free GPU memory before the FSDP→vLLM transition.
         # Without this, fragmented allocations from training + influence prepass
         # can prevent vLLM's cumem_allocator from mapping KV cache memory.
