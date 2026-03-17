@@ -458,6 +458,8 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        if not hasattr(self, "_update_policy_call_count"):
+            self._update_policy_call_count = 0
         self._influence_rows = []
         influence_enabled = self._setup_influence_trace(data.meta_info)
         influence_token_weight_cfg = InfluenceTokenWeightConfig.from_dict(
@@ -669,6 +671,16 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
+                # Memory profiling: log per-phase GPU memory for first 2 steps
+                _mem_profile = (batch_idx == 0 and epoch == 0 and
+                                self._update_policy_call_count < 2 and _rank0())
+                if _mem_profile:
+                    torch.cuda.reset_peak_memory_stats()
+                    _mem_before = torch.cuda.memory_allocated() / (1024**3)
+                    print(f"[mem_profile] step={self._update_policy_call_count} "
+                          f"before_micro_batch: alloc={_mem_before:.2f}GB "
+                          f"reserved={torch.cuda.memory_reserved()/(1024**3):.2f}GB")
+
                 for micro_idx, data in enumerate(micro_batches):
                     # Support all hardwares
                     if isinstance(data, DataProto):
@@ -738,6 +750,9 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     _sync_for_timing()
                     influence_timing["forward_1"] += time.perf_counter() - t_forward_1
+                    if _mem_profile and micro_idx == 0:
+                        print(f"[mem_profile] after_forward: alloc={torch.cuda.memory_allocated()/(1024**3):.2f}GB "
+                              f"peak={torch.cuda.max_memory_allocated()/(1024**3):.2f}GB")
                     if capture_with_separate_backward:
                         tracer = self._influence_tracer
                         if tracer is None:
@@ -919,6 +934,9 @@ class DataParallelPPOActor(BasePPOActor):
                     loss.backward()
                     _sync_for_timing()
                     influence_timing["loss_backward"] += time.perf_counter() - t_loss_bw
+                    if _mem_profile and micro_idx == 0:
+                        print(f"[mem_profile] after_backward: alloc={torch.cuda.memory_allocated()/(1024**3):.2f}GB "
+                              f"peak={torch.cuda.max_memory_allocated()/(1024**3):.2f}GB")
                     if capture_with_training_backward:
                         tracer = self._influence_tracer
                         if tracer is not None:
@@ -948,6 +966,10 @@ class DataParallelPPOActor(BasePPOActor):
                 if profile_influence_timing and _rank0():
                     print("[influence_trace][phase] before_optimizer_step")
                 grad_norm = self._optimizer_step()
+                if _mem_profile:
+                    print(f"[mem_profile] after_optimizer_step: alloc={torch.cuda.memory_allocated()/(1024**3):.2f}GB "
+                          f"peak={torch.cuda.max_memory_allocated()/(1024**3):.2f}GB "
+                          f"n_micro_batches={len(micro_batches)}")
                 if profile_influence_timing and _rank0():
                     print("[influence_trace][phase] after_optimizer_step")
                 if self._influence_cfg is not None and self._influence_cfg.skip_optimizer_step:
@@ -1038,6 +1060,7 @@ class DataParallelPPOActor(BasePPOActor):
                 },
             )
         self.actor_optimizer.zero_grad()
+        self._update_policy_call_count += 1
         # Store token weight cache for NPZ persistence
         self._token_weight_cache = _cached_token_weights
         # Aggressively free GPU memory before the FSDP→vLLM transition.
