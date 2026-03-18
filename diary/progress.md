@@ -41,6 +41,8 @@ avg@4 = mean accuracy across 4 samples (≈ pass@1). pass@4 = at least 1 of 4 co
 
 | Date | Run | Config | Result | Key Metrics |
 | --- | --- | --- | --- | --- |
+| 2026-03-18 | `infl-bsz128-hessian` | 4xH200, Qwen3-4B, bsz=128, `inverse`, f16, allsel, chunked | Pass | **AUC=0.978**, GapDir=81.9%, step=337s (+32% overhead), peak=161GB |
+| 2026-03-18 | `infl-bsz128-nohessian` | 4xH200, Qwen3-4B, bsz=128, `identity`, f16, allsel | Pass | AUC=0.618, GapDir=50.3%, step=256s (+0.4% overhead), peak=155GB |
 | 2026-03-04 | `archer-inflw-tanh` | 4xH200, R1-1.5B, `mode=tanh`, `alpha=0.5`, `tau=1.0`, `clamp=[0.5,2.0]`, f=64 | Running | Step 1: `masked_frac=0.688`, `grad_norm=0.075`, `entropy=0.788` |
 | 2026-03-03 | `InflWeight-Softmax` | 4xH200, R1-1.5B, `mode=softmax`, `T=10.0`, `clamp=[0.1,5.0]`, f=64 | Pass | MATH-500 step 100: 80.50% avg@4, 91.6% pass@4; stopped at step 100 |
 | 2026-03-02 | `InflWeight-PerPrompt` | 4xH200, R1-1.5B, `mode=zero`, `threshold=1.0`, `per_prompt`, f=64 | Pass | MATH-500 step 100: 78.05% avg@4, 90.8% pass@4 |

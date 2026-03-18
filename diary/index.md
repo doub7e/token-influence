@@ -4,6 +4,7 @@ Entries are listed newest-first.
 
 | Date | Title | Commit | File |
 | --- | --- | --- | --- |
+| 2026-03-18 | Chunked Inverse Hessian for bsz=128 Influence Trace | `a2eb7f7` | `diary/2026-03-18-chunked-inverse-bsz128-a2eb7f7.md` |
 | 2026-03-16 | Credit & Mask Mode Token Influence Experiments | `d13eebf` | `diary/2026-03-16-credit-mask-mode-experiments-d13eebf.md` |
 | 2026-03-09 | Additive Influence Token Weight Mode (λ sweep) | `81d699c` | `diary/2026-03-09-additive-influence-token-weight-mode-81d699c.md` |
 | 2026-03-09 | Cross-GPU Contrastive Direction (`global_selected` Mode) | `f4075f0` | `diary/2026-03-09-global-selected-cross-gpu-contrastive-f4075f0.md` |
