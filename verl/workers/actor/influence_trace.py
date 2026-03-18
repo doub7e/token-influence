@@ -805,16 +805,41 @@ class TokenInfluenceTracer:
                     continue
             else:
                 t_tok = time.perf_counter()
-                g_tok = torch.bmm(u_g.unsqueeze(2), v_g.unsqueeze(1)).reshape(u_g.shape[0], -1)
                 uniq_rows, inv = torch.unique(row_g, sorted=True, return_inverse=True)
+                D = u_g.shape[1] * v_g.shape[1]  # k_out * k_in
 
-                g_resp = torch.zeros((uniq_rows.numel(), g_tok.shape[1]), device=g_tok.device, dtype=g_tok.dtype)
-                g_resp.index_add_(0, inv, g_tok)
-                row_acc = torch.zeros((uniq_rows.numel(),), device=g_tok.device, dtype=torch.bool)
+                # --- Memory-efficient chunked gradient reconstruction ---
+                # Instead of materializing full [n_tokens, D] g_tok at once,
+                # we process chunks to bound peak GPU memory.
+                # g_tok = vec(u ⊗ v) has shape [n_tokens, D].
+                # With 200k tokens and D=50k, that's 40 GiB — too much.
+                # We chunk to keep each chunk under ~4 GiB.
+                _MAX_CHUNK_BYTES = 4 * 1024**3  # 4 GiB
+                _chunk_size = max(1, _MAX_CHUNK_BYTES // (D * 4))  # fp32
+                n_tokens = u_g.shape[0]
+                _dev, _dt = u_g.device, u_g.dtype
+
+                # Step 1: Build g_resp and hessian via chunked accumulation.
+                # g_resp[r] = Σ_{t in r} g_t, hessian = G^T G (or g_resp^T g_resp)
+                g_resp = torch.zeros((uniq_rows.numel(), D), device=_dev, dtype=_dt)
+                use_token_hessian = (self.cfg.hessian_source == "token")
+                hessian = torch.zeros((D, D), device=_dev, dtype=_dt)
+
+                for c_start in range(0, n_tokens, _chunk_size):
+                    c_end = min(c_start + _chunk_size, n_tokens)
+                    g_chunk = torch.bmm(
+                        u_g[c_start:c_end].unsqueeze(2),
+                        v_g[c_start:c_end].unsqueeze(1),
+                    ).reshape(c_end - c_start, -1)
+                    g_resp.index_add_(0, inv[c_start:c_end], g_chunk)
+                    if use_token_hessian:
+                        hessian.addmm_(g_chunk.T, g_chunk)
+                    del g_chunk
+
+                row_acc = torch.zeros((uniq_rows.numel(),), device=_dev, dtype=torch.bool)
                 row_acc.index_put_((inv,), acc_g, accumulate=False)
-                # For advantage mode, get per-response advantage values
                 if self.cfg.contrastive_agg == "advantage":
-                    row_adv = torch.zeros((uniq_rows.numel(),), device=g_tok.device, dtype=torch.float32)
+                    row_adv = torch.zeros((uniq_rows.numel(),), device=_dev, dtype=torch.float32)
                     row_adv.index_put_((inv,), adv_g, accumulate=False)
                     if row_adv.abs().max() < 1e-8:
                         self._debug["groups_skipped_all_same"] += 1
@@ -826,153 +851,127 @@ class TokenInfluenceTracer:
                     continue
                 self._timing["token_scoring_s"] += time.perf_counter() - t_tok
 
+                # Step 2: Build and factorize hessian.
                 t_hess = time.perf_counter()
-                hess_source = g_tok if self.cfg.hessian_source == "token" else g_resp
-                solved = self._compute_kernel_solve(
-                    g_resp=hess_source, g_tok=g_tok,
-                    reg_lambda=self.cfg.reg_lambda,
-                )
+                if not use_token_hessian:
+                    hessian = g_resp.T @ g_resp
+                reg = self.cfg.reg_lambda
+                if reg <= 0:
+                    reg = float((hessian.trace() / max(D, 1)).item()) * 0.1
+                hessian.add_(torch.eye(D, device=_dev, dtype=_dt), alpha=reg)
+                chol = torch.linalg.cholesky(hessian)
+                del hessian
+
+                # Step 3: Compute solved = H^{-1} g_tok in chunks and derive scores.
+                # We never hold both g_tok and solved in full; instead we stream
+                # chunks of g_tok through the pre-computed Cholesky factor.
+
+                # First compute the contrastive direction from g_resp.
+                if use_global and self.cfg.contrastive_agg in ("sum", "mean"):
+                    _D = g_resp.shape[1]
+                    sum_acc = g_resp[row_acc].sum(0) if row_acc.any() else torch.zeros(_D, device=_dev, dtype=_dt)
+                    sum_rej = g_resp[~row_acc].sum(0) if (~row_acc).any() else torch.zeros(_D, device=_dev, dtype=_dt)
+                    counts = torch.tensor([float(row_acc.sum()), float((~row_acc).sum())], device=_dev, dtype=_dt)
+                    buf = torch.cat([sum_acc, sum_rej, counts])
+                    torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+                    sum_acc_g, sum_rej_g = buf[:_D], buf[_D:2*_D]
+                    n_acc_g, n_rej_g = buf[2*_D].clamp(min=1), buf[2*_D+1].clamp(min=1)
+                    if n_acc_g < 1 or n_rej_g < 1:
+                        self._debug["groups_skipped_all_same"] += 1
+                        self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
+                        continue
+                    if self.cfg.contrastive_agg == "mean":
+                        d_contrastive = sum_acc_g / n_acc_g - sum_rej_g / n_rej_g
+                    else:
+                        d_contrastive = sum_acc_g - sum_rej_g
+                    _is_global = True
+                else:
+                    d_contrastive = None
+                    _is_global = False
+
+                # Now stream g_tok chunks to compute per-token scores.
+                score = torch.empty(n_tokens, device=_dev, dtype=_dt)
+
+                for c_start in range(0, n_tokens, _chunk_size):
+                    c_end = min(c_start + _chunk_size, n_tokens)
+                    g_chunk = torch.bmm(
+                        u_g[c_start:c_end].unsqueeze(2),
+                        v_g[c_start:c_end].unsqueeze(1),
+                    ).reshape(c_end - c_start, -1)
+                    # solved_chunk = H^{-1} g_chunk^T → [D, chunk_size]
+                    solved_chunk = torch.cholesky_solve(g_chunk.T, chol)
+
+                    if self.cfg.token_unit_norm:
+                        mahal_sq = (g_chunk * solved_chunk.T).sum(dim=-1)
+                        mahal = mahal_sq.clamp(min=1e-16).sqrt()
+                        solved_chunk = solved_chunk / mahal.unsqueeze(0)
+
+                    if _is_global:
+                        score[c_start:c_end] = d_contrastive @ solved_chunk
+                        if self.cfg.exclude_self_response:
+                            # self_infl for leave-one-out
+                            local_infl_chunk = g_resp @ solved_chunk  # [n_resp, chunk]
+                            self_infl = local_infl_chunk[inv[c_start:c_end], torch.arange(c_end - c_start, device=_dev)]
+                            acc_chunk = acc_g[c_start:c_end]
+                            if self.cfg.contrastive_agg == "mean":
+                                sum_acc_score = sum_acc_g @ solved_chunk
+                                sum_rej_score = sum_rej_g @ solved_chunk
+                                score_exclude = torch.where(
+                                    acc_chunk,
+                                    (sum_acc_score - self_infl) / (n_acc_g - 1).clamp(min=1) - sum_rej_score / n_rej_g,
+                                    sum_acc_score / n_acc_g - (sum_rej_score - self_infl) / (n_rej_g - 1).clamp(min=1),
+                                )
+                            else:
+                                sign_per_token = torch.where(acc_chunk, 1.0, -1.0)
+                                score_exclude = score[c_start:c_end] - sign_per_token * self_infl
+                            _scale = self.cfg.self_influence_scale
+                            if _scale <= 0:
+                                score[c_start:c_end] = score_exclude
+                            elif _scale < 1:
+                                score[c_start:c_end] = (1.0 - _scale) * score_exclude + _scale * score[c_start:c_end]
+                    else:
+                        # Local contrastive scoring
+                        infl_chunk = g_resp @ solved_chunk  # [n_resp, chunk]
+                        inv_chunk = inv[c_start:c_end]
+                        if self.cfg.contrastive_agg == "advantage":
+                            full_score = (row_adv.unsqueeze(1) * infl_chunk).sum(dim=0)
+                            self_contrib = row_adv[inv_chunk] * infl_chunk[inv_chunk, torch.arange(c_end - c_start, device=_dev)]
+                            score[c_start:c_end] = full_score - self_contrib
+                        elif self.cfg.contrastive_agg == "mean":
+                            score[c_start:c_end] = infl_chunk[row_acc].mean(dim=0) - infl_chunk[~row_acc].mean(dim=0)
+                        else:
+                            score[c_start:c_end] = infl_chunk[row_acc].sum(dim=0) - infl_chunk[~row_acc].sum(dim=0)
+                    del g_chunk, solved_chunk
+
+                del chol
                 self._timing["hessian_solve_s"] += time.perf_counter() - t_hess
 
                 # --- Hessian similarity diagnostic ---
                 if self.cfg.debug_hessian_similarity and self._is_rank0():
-                    hessian_raw = hess_source.T @ hess_source  # [D, D]
-                    h_norm = hessian_raw / hessian_raw.norm().clamp(min=1e-12)
+                    # Rebuild hessian for diagnostic (small cost)
+                    hess_diag = g_resp.T @ g_resp
+                    h_norm = hess_diag / hess_diag.norm().clamp(min=1e-12)
                     if module_name not in self._hessian_diag:
                         self._hessian_diag[module_name] = []
                     self._hessian_diag[module_name].append(h_norm.detach().cpu())
-                    # Collect response gradients for accumulated dot-product analysis
                     _diag_grads.append((
                         uniq_rows.detach().cpu(),
                         g_resp.detach().cpu(),
                         row_acc.detach().cpu(),
                     ))
-                    # Accumulate hessian outer product for global H^{-1} solve
-                    _hs64 = hess_source.to(torch.float64)
-                    _hh = _hs64.T @ _hs64  # [D, D]
+                    _hs64 = g_resp.to(torch.float64)
+                    _hh = _hs64.T @ _hs64
                     if _diag_hess_accum is None:
                         _diag_hess_accum = _hh
                     else:
                         _diag_hess_accum += _hh
                     del _hs64, _hh
-                    # Store row metadata (accepted, group_id) per global row
                     _gid_int = int(gid) if gid is not None else -1
                     for k in range(uniq_rows.numel()):
                         rid = int(uniq_rows[k].item())
                         self._grad_row_meta[rid] = (bool(row_acc[k].item()), _gid_int)
 
-                # --- TrackStar: Mahalanobis-normalize tokens for direction & scoring ---
-                # ||H^{-1/2} g_t||^2 = g_t^T H^{-1} g_t = g_t . solved_t.
-                # Dividing g_t by this norm and scoring with solved/norm gives
-                # cosine similarity in the H^{-1/2} space — mathematically
-                # equivalent to explicitly computing H^{-1/2} g / ||H^{-1/2} g||.
-                # Both d (direction) and per-token scores are normalized,
-                # so no single high-magnitude token dominates.
-                if self.cfg.token_unit_norm:
-                    mahal_sq = (g_tok * solved.T).sum(dim=-1)  # [n_tokens]
-                    mahal = mahal_sq.clamp(min=1e-16).sqrt()
-                    # Only normalize the scoring side (solved / H^{-1} g_t),
-                    # keep g_resp built from raw g_tok so the contrastive
-                    # direction preserves natural gradient magnitudes — tokens
-                    # with larger gradients (more model impact) contribute more
-                    # to the accepted-vs-rejected direction.
-                    # g_resp is already computed from raw g_tok above.
-                    solved = solved / mahal.unsqueeze(0)  # [D, n_tokens]
-
-                t_tok2 = time.perf_counter()
-
-                if use_global and self.cfg.contrastive_agg in ("sum", "mean"):
-                    # --- Cross-GPU contrastive direction (global_selected) ---
-                    # All-reduce gradient sums to form a global d, keep Hessian solve local.
-                    D = g_resp.shape[1]
-                    _dev = g_resp.device
-                    _dt = g_resp.dtype
-                    sum_acc = g_resp[row_acc].sum(0) if row_acc.any() else torch.zeros(D, device=_dev, dtype=_dt)
-                    sum_rej = g_resp[~row_acc].sum(0) if (~row_acc).any() else torch.zeros(D, device=_dev, dtype=_dt)
-                    counts = torch.tensor([float(row_acc.sum()), float((~row_acc).sum())], device=_dev, dtype=_dt)
-                    buf = torch.cat([sum_acc, sum_rej, counts])
-                    torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
-                    sum_acc_g, sum_rej_g = buf[:D], buf[D:2*D]
-                    n_acc_g, n_rej_g = buf[2*D].clamp(min=1), buf[2*D+1].clamp(min=1)
-
-                    if n_acc_g < 1 or n_rej_g < 1:
-                        self._debug["groups_skipped_all_same"] += 1
-                        self._timing["token_scoring_s"] += time.perf_counter() - t_tok2
-                        continue
-
-                    if self.cfg.contrastive_agg == "mean":
-                        d_global = sum_acc_g / n_acc_g - sum_rej_g / n_rej_g
-                    else:
-                        d_global = sum_acc_g - sum_rej_g
-                    score = d_global @ solved  # [n_tokens]
-
-                    # Leave-one-out with global statistics
-                    if self.cfg.exclude_self_response:
-                        local_infl = g_resp @ solved  # [n_resp_local, n_tokens]
-                        self_infl = local_infl[inv, torch.arange(inv.numel(), device=inv.device)]
-                        if self.cfg.contrastive_agg == "mean":
-                            sum_acc_score = sum_acc_g @ solved  # [n_tokens]
-                            sum_rej_score = sum_rej_g @ solved  # [n_tokens]
-                            score_exclude = torch.where(
-                                acc_g,
-                                (sum_acc_score - self_infl) / (n_acc_g - 1).clamp(min=1) - sum_rej_score / n_rej_g,
-                                sum_acc_score / n_acc_g - (sum_rej_score - self_infl) / (n_rej_g - 1).clamp(min=1),
-                            )
-                        else:
-                            sign_per_token = torch.where(acc_g, 1.0, -1.0)
-                            score_exclude = score - sign_per_token * self_infl
-                        _scale = self.cfg.self_influence_scale
-                        if _scale <= 0:
-                            score = score_exclude
-                        elif _scale < 1:
-                            score = (1.0 - _scale) * score_exclude + _scale * score
-                else:
-                    # --- Local contrastive scoring (all_selected / per_prompt) ---
-                    infl = g_resp @ solved  # [n_resp, n_tokens]
-                    if self.cfg.contrastive_agg == "advantage":
-                        full_score = (row_adv.unsqueeze(1) * infl).sum(dim=0)
-                        self_contrib = row_adv[inv] * infl[inv, torch.arange(inv.numel(), device=inv.device)]
-                        score = full_score - self_contrib
-                    elif self.cfg.contrastive_agg == "mean":
-                        score = infl[row_acc].mean(dim=0) - infl[~row_acc].mean(dim=0)
-                    else:
-                        score = infl[row_acc].sum(dim=0) - infl[~row_acc].sum(dim=0)
-
-                    if self.cfg.exclude_self_response and self.cfg.contrastive_agg != "advantage":
-                        self_infl = infl[inv, torch.arange(inv.numel(), device=inv.device)]
-                        score_include = score
-                        if self.cfg.contrastive_agg == "mean":
-                            n_acc = row_acc.sum().float()
-                            n_rej = (~row_acc).sum().float()
-                            sum_acc = infl[row_acc].sum(dim=0)
-                            sum_rej = infl[~row_acc].sum(dim=0)
-                            score_exclude = torch.where(
-                                acc_g,
-                                (sum_acc - self_infl) / (n_acc - 1).clamp(min=1) - sum_rej / n_rej.clamp(min=1),
-                                sum_acc / n_acc.clamp(min=1) - (sum_rej - self_infl) / (n_rej - 1).clamp(min=1),
-                            )
-                        else:
-                            sign_per_token = torch.where(acc_g, 1.0, -1.0)
-                            score_exclude = score_include - sign_per_token * self_infl
-
-                        _scale = self.cfg.self_influence_scale
-                        if _scale <= 0:
-                            score = score_exclude
-                        elif _scale >= 1:
-                            score = score_include
-                        else:
-                            score = (1.0 - _scale) * score_exclude + _scale * score_include
-
-                # --- Per-token normalization (legacy h_inv_norm mode) ---
-                # Only applies when token_unit_norm is off; when on, the
-                # H^{-1/2} unit-normalization above already handles this.
-                if self.cfg.score_normalization == "h_inv_norm" and not self.cfg.token_unit_norm:
-                    h_inv_norm_sq = (g_tok * solved.T).sum(dim=-1)  # [n_tokens]
-                    h_inv_norm = h_inv_norm_sq.clamp(min=1e-8).sqrt()
-                    score = score / h_inv_norm
-
                 pair = row_g * stride + tok_g
-                self._timing["token_scoring_s"] += time.perf_counter() - t_tok2
 
             pair_out.append(pair)
             score_out.append(score)
