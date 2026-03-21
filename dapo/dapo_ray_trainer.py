@@ -508,6 +508,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             "additive_clamp_min": float(influence_token_weight_cfg.get("additive_clamp_min", -1.0)),
                             "additive_clamp_max": float(influence_token_weight_cfg.get("additive_clamp_max", 3.0)),
                             "apply_to": str(influence_token_weight_cfg.get("apply_to", "all")),
+                            "return_gamma": float(influence_token_weight_cfg.get("return_gamma", 1.0)),
                         }
                         # update actor
                         with _timer("update_actor", timing_raw):
@@ -524,7 +525,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 for shard in tw_cache_arr:
                                     if isinstance(shard, dict):
                                         tw_cache.update(shard)
-                            _tw_default = 0.0 if influence_token_weight_cfg.get("mode", "zero") == "credit" else 1.0
+                            _tw_default = 0.0 if influence_token_weight_cfg.get("mode", "zero") in ("credit", "return") else 1.0
                             influence_trace_writer.write_step(
                                 step=self.global_steps,
                                 batch=batch,

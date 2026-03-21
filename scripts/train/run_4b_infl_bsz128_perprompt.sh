@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run 4 influence trace configs sequentially for quality analysis.
+# Test influence trace with bsz=128, hessian (inverse), scope=per_prompt.
+# Compare with all_selected result from run_4b_infl_bsz128.sh.
 set -xeuo pipefail
 
 export WANDB_API_KEY="$(cat /scratch/cvlab/home/shuli/.codex/secrets/wandb_api_key)"
@@ -16,7 +17,7 @@ python scripts/train/download_hf_model.py \
 BASE_DIR="./output/Archer2.0"
 SRC_CKPT="$BASE_DIR/Archer2.0-Qwen3-4B-Base-Baseline-ep1-clip02-028/global_step_300"
 
-# Common Hydra args (array)
+# Common Hydra args — bsz=128, mini_bsz=32, dynamic_bsz=True
 COMMON_ARGS=(
     data.train_files=./data/train/archer2.0-math-1.5b-train.json
     data.val_files=./data/test/math500.json
@@ -25,8 +26,8 @@ COMMON_ARGS=(
     "data.truncation=error"
     data.max_prompt_length=2048
     data.max_response_length=4096
-    data.gen_batch_size=32
-    data.train_batch_size=32
+    data.gen_batch_size=128
+    data.train_batch_size=128
     actor_rollout_ref.rollout.n=16
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
@@ -38,28 +39,28 @@ COMMON_ARGS=(
     actor_rollout_ref.actor.clip_ratio_high=0.28
     actor_rollout_ref.actor.clip_ratio_c=3.0
     actor_rollout_ref.model.use_remove_padding=True
-    actor_rollout_ref.actor.use_dynamic_bsz=False
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
+    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8
     +actor_rollout_ref.actor.high_entropy_kl_loss_scale_coef=0.0
     +actor_rollout_ref.actor.low_entropy_clip_ratio_low=0.2
     +actor_rollout_ref.actor.low_entropy_clip_ratio_high=0.2
     +actor_rollout_ref.actor.high_entropy_clip_ratio_low=0.4
     +actor_rollout_ref.actor.high_entropy_clip_ratio_high=0.4
     +actor_rollout_ref.actor.use_archer_policy_loss=False
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=False
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=6144
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=6144
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=6144
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576
     actor_rollout_ref.model.path=./models/Qwen3-4B-Base
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.actor.optim.lr=1e-6
     actor_rollout_ref.actor.optim.lr_warmup_steps=10
     actor_rollout_ref.actor.optim.weight_decay=0.1
     actor_rollout_ref.actor.ppo_epochs=1
-    actor_rollout_ref.actor.ppo_mini_batch_size=8
+    actor_rollout_ref.actor.ppo_mini_batch_size=32
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
     actor_rollout_ref.actor.entropy_coeff=0
@@ -69,7 +70,7 @@ COMMON_ARGS=(
     actor_rollout_ref.rollout.gpu_memory_utilization=0.82
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.rollout.enable_chunked_prefill=True
-    actor_rollout_ref.rollout.max_num_batched_tokens=6144
+    actor_rollout_ref.rollout.max_num_batched_tokens=24576
     actor_rollout_ref.rollout.max_model_len=6144
     actor_rollout_ref.rollout.temperature=1.0
     actor_rollout_ref.rollout.top_p=1.0
@@ -95,7 +96,7 @@ COMMON_ARGS=(
     trainer.test_freq=-1
     trainer.save_freq=999
     trainer.total_epochs=1
-    trainer.total_training_steps=302
+    trainer.total_training_steps=301
     trainer.resume_mode=auto
     +trainer.enable_overlong_filter=False
     +trainer.rejection_sample=True
@@ -105,7 +106,6 @@ COMMON_ARGS=(
     +trainer.influence_trace.fsync=False
     +trainer.influence_trace.max_prompts_per_step=0
     +trainer.influence_trace.reg_lambda=-1.0
-    +trainer.influence_trace.hessian_mode=inverse
     +trainer.influence_trace.output_function=log_prob
     +trainer.influence_trace.max_modules=-1
     +trainer.influence_trace.max_proj_vector_sum=-1
@@ -143,24 +143,17 @@ run_one() {
         "$@" \
         2>&1 | tee "$DST/${NAME}_grpo.log"
     echo "====== DONE: $NAME ======"
+    # Clean up checkpoint to save space
+    rm -rf "$DST/global_step_300" "$DST/global_step_301"
 }
 
-# Config 6: DONE (lm_head f128, AUC=0.68)
-
-# Config 7: last MLP, factor=16, max_hessian_dim=50000 (k_in~130, k_out~384 per module)
-run_one "infl-diag-lastmlp-f16-hd50k-allsel" \
+# lastmlp-f16 with hessian (inverse), scope=per_prompt
+run_one "infl-bsz128-lastmlp-f16-perprompt" \
+    ++trainer.influence_trace.hessian_mode=inverse \
     ++trainer.influence_trace.projection_dim_factor=16 \
     ++trainer.influence_trace.max_hessian_dim=50000 \
     ++trainer.influence_trace.max_modules=1 \
-    ++trainer.influence_trace.accepted_rejected_scope=all_selected \
+    ++trainer.influence_trace.accepted_rejected_scope=per_prompt \
     "++trainer.influence_trace.module_name_filter=[mlp.gate_proj,mlp.up_proj,mlp.down_proj]"
 
-# Config 8: last MLP, factor=32, no hessian limit (k_in=80, k_out=304 → hessian=24320)
-run_one "infl-diag-lastmlp-f32-allsel-v2" \
-    ++trainer.influence_trace.projection_dim_factor=32 \
-    ++trainer.influence_trace.max_hessian_dim=-1 \
-    ++trainer.influence_trace.max_modules=1 \
-    ++trainer.influence_trace.accepted_rejected_scope=all_selected \
-    "++trainer.influence_trace.module_name_filter=[mlp.gate_proj,mlp.up_proj,mlp.down_proj]"
-
-echo "===== ALL CONFIGS COMPLETE ====="
+echo "===== BSZ128 PERPROMPT COMPLETE ====="

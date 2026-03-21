@@ -19,3 +19,4 @@ wandb/
 
 # Local model checkpoints (do not commit weights)
 models/
+.claude/worktrees/

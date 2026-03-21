@@ -933,12 +933,34 @@ class TokenInfluenceTracer:
                         # Local contrastive scoring
                         infl_chunk = g_resp @ solved_chunk  # [n_resp, chunk]
                         inv_chunk = inv[c_start:c_end]
+                        _cs = c_end - c_start
                         if self.cfg.contrastive_agg == "advantage":
                             full_score = (row_adv.unsqueeze(1) * infl_chunk).sum(dim=0)
-                            self_contrib = row_adv[inv_chunk] * infl_chunk[inv_chunk, torch.arange(c_end - c_start, device=_dev)]
+                            self_contrib = row_adv[inv_chunk] * infl_chunk[inv_chunk, torch.arange(_cs, device=_dev)]
                             score[c_start:c_end] = full_score - self_contrib
                         elif self.cfg.contrastive_agg == "mean":
-                            score[c_start:c_end] = infl_chunk[row_acc].mean(dim=0) - infl_chunk[~row_acc].mean(dim=0)
+                            n_acc_local = row_acc.sum().float()
+                            n_rej_local = (~row_acc).sum().float()
+                            if self.cfg.exclude_self_response:
+                                sum_acc_infl = infl_chunk[row_acc].sum(dim=0)
+                                sum_rej_infl = infl_chunk[~row_acc].sum(dim=0)
+                                self_infl = infl_chunk[inv_chunk, torch.arange(_cs, device=_dev)]
+                                acc_chunk = acc_g[c_start:c_end]
+                                score_exclude = torch.where(
+                                    acc_chunk,
+                                    (sum_acc_infl - self_infl) / (n_acc_local - 1).clamp(min=1) - sum_rej_infl / n_rej_local.clamp(min=1),
+                                    sum_acc_infl / n_acc_local.clamp(min=1) - (sum_rej_infl - self_infl) / (n_rej_local - 1).clamp(min=1),
+                                )
+                                _scale = self.cfg.self_influence_scale
+                                score_include = sum_acc_infl / n_acc_local.clamp(min=1) - sum_rej_infl / n_rej_local.clamp(min=1)
+                                if _scale <= 0:
+                                    score[c_start:c_end] = score_exclude
+                                elif _scale >= 1:
+                                    score[c_start:c_end] = score_include
+                                else:
+                                    score[c_start:c_end] = (1.0 - _scale) * score_exclude + _scale * score_include
+                            else:
+                                score[c_start:c_end] = infl_chunk[row_acc].mean(dim=0) - infl_chunk[~row_acc].mean(dim=0)
                         else:
                             score[c_start:c_end] = infl_chunk[row_acc].sum(dim=0) - infl_chunk[~row_acc].sum(dim=0)
                     del g_chunk, solved_chunk

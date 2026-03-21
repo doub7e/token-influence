@@ -42,6 +42,10 @@ class InfluenceTokenWeightConfig:
     additive_clamp_min: float = -1.0  # min weight (< 0 allows sign flip)
     additive_clamp_max: float = 3.0  # max weight
     apply_to: str = "all"  # "all" | "positive" | "negative" — which responses to weight
+    # return mode params: G_t = Σ_{k=t}^T γ^{k-t} s_k (suffix-sum return-to-go)
+    # Treats influence scores as token-level rewards; computes RL-style return.
+    # Applied as additive correction: A'_t = A_t + λ * G_t
+    return_gamma: float = 1.0  # discount factor (1.0 = undiscounted, <1 = exponential decay)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InfluenceTokenWeightConfig":
@@ -69,6 +73,7 @@ class InfluenceTokenWeightConfig:
             additive_clamp_min=float(d.get("additive_clamp_min", -1.0)),
             additive_clamp_max=float(d.get("additive_clamp_max", 3.0)),
             apply_to=str(d.get("apply_to", "all")),
+            return_gamma=float(d.get("return_gamma", 1.0)),
         )
 
 
@@ -98,8 +103,8 @@ def build_token_loss_weights(
             weight arrays (for NPZ persistence / visualization).
     """
     bsz, seq_len = advantages.shape
-    # For "credit" mode, weights are additive corrections (init 0); otherwise multiplicative (init 1)
-    _init_val = 0.0 if config.mode == "credit" else 1.0
+    # For additive correction modes, weights are corrections (init 0); otherwise multiplicative (init 1)
+    _init_val = 0.0 if config.mode in ("credit", "return") else 1.0
     weights = torch.full((bsz, seq_len), _init_val, device=advantages.device, dtype=advantages.dtype)
     stats: dict[str, float] = {}
     per_row_weights: dict[int, np.ndarray] = {}
@@ -250,6 +255,32 @@ def build_token_loss_weights(
                 continue  # all same score → keep correction=0
             z = (valid_s - mu) / sigma
             correction = config.additive_lambda * z
+            correction = correction.clamp(config.additive_clamp_min, config.additive_clamp_max)
+            weights[i, valid] = correction.to(weights.dtype)
+            influenced[i] = valid
+            continue
+
+        if config.mode == "return":
+            # Return-to-go mode: treat influence scores as token-level rewards
+            # and compute RL-style return G_t = Σ_{k=t}^T γ^{k-t} s_k.
+            # Sign flip for rejected responses (high influence in rejected = bad).
+            # Applied as additive correction: A'_t = A_t + λ * G_t
+            if config.apply_to == "positive" and not is_accepted[i]:
+                continue
+            if config.apply_to == "negative" and is_accepted[i]:
+                continue
+            valid_s = scores[valid]
+            if not is_accepted[i]:
+                valid_s = -valid_s  # sign flip for rejected
+            # Compute suffix-sum return-to-go
+            gamma = config.return_gamma
+            T = valid_s.shape[0]
+            G = torch.zeros_like(valid_s)
+            G[T - 1] = valid_s[T - 1]
+            for t in range(T - 2, -1, -1):
+                G[t] = valid_s[t] + gamma * G[t + 1]
+            # Scale and clamp
+            correction = config.additive_lambda * G
             correction = correction.clamp(config.additive_clamp_min, config.additive_clamp_max)
             weights[i, valid] = correction.to(weights.dtype)
             influenced[i] = valid

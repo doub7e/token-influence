@@ -273,7 +273,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    logits_rmpad = logits_rmpad / temperature  # avoid inplace for backward hooks
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -348,7 +348,7 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits = output.logits
 
-                    logits.div_(temperature)
+                    logits = logits / temperature  # avoid inplace for backward hooks
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
@@ -828,7 +828,9 @@ class DataParallelPPOActor(BasePPOActor):
                             accepted=_accepted,
                         )
                         _cached_token_weights.update(tw_per_row)
-                        masked_frac = float((token_weights != 1.0).float().sum() / max(response_mask.sum(), 1))
+                        # For additive modes (credit/return) baseline is 0.0; for multiplicative modes it's 1.0
+                        _tw_noop = 0.0 if influence_token_weight_cfg.mode in ("credit", "return") else 1.0
+                        masked_frac = float((token_weights != _tw_noop).float().sum() / max(response_mask.sum(), 1))
                         append_to_dict(metrics, {"actor/token_weight_masked_frac": masked_frac})
                         # Log sign guard stats
                         for k, v in tw_stats.items():
@@ -847,15 +849,18 @@ class DataParallelPPOActor(BasePPOActor):
                     # Apply influence weights: direct mode targets advantages, others target loss
                     token_weights_for_loss = None
                     if token_weights is not None:
-                        if influence_token_weight_cfg.mode == "credit" and influence_token_weight_cfg.adv_target == "advantage":
-                            # Credit mode: additive correction A'_t = A_t + correction_t
+                        if influence_token_weight_cfg.mode in ("credit", "return") and influence_token_weight_cfg.adv_target == "advantage":
+                            # Credit/Return mode: additive correction A'_t = A_t + correction_t
                             advantages = advantages + token_weights
                         elif (
-                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio", "additive", "mask", "mask_random", "mask_soft", "mask_threshold")
+                            influence_token_weight_cfg.mode in ("direct", "random", "direct_no_baseline", "direct_no_baseline_random", "ratio", "additive", "mask", "mask_random", "mask_soft", "mask_threshold", "softmax", "tanh")
                             and influence_token_weight_cfg.adv_target == "advantage"
                         ):
                             advantages = advantages * token_weights
                             # token_weights_for_loss stays None — don't also multiply loss
+                        elif influence_token_weight_cfg.mode in ("credit", "return"):
+                            # Additive modes with adv_target!=advantage: not supported (baseline is 0, not 1)
+                            pass  # silently skip — do not apply as multiplicative loss weight
                         else:
                             token_weights_for_loss = token_weights
 
